@@ -318,6 +318,9 @@ static irqreturn_t ks8851_irq(int irq, void *_ks)
 
 	ks8851_lock(ks, &flags);
 
+	/* Disable chip interrupts to de-assert the IRQ line immediately */
+	ks8851_wrreg16(ks, KS_IER, 0x0000);
+
 	status = ks8851_rdreg16(ks, KS_ISR);
 	ks8851_wrreg16(ks, KS_ISR, status);
 
@@ -373,16 +376,36 @@ static irqreturn_t ks8851_irq(int irq, void *_ks)
 		ks8851_wrreg16(ks, KS_RXCR1, rxc->rxcr1);
 	}
 
-	ks8851_unlock(ks, &flags);
+	/* Re-enable chip interrupts now that we've serviced everything */
+	ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
 
-	if (status & IRQ_LCI)
-		mii_check_link(&ks->mii);
+	ks8851_unlock(ks, &flags);
 
 	if (status & IRQ_RXI)
 		while ((skb = __skb_dequeue(&rxq)))
 			netif_rx(skb);
 
 	return IRQ_HANDLED;
+}
+
+/**
+ * ks8851_poll_work - periodic polling of KSZ8851 interrupt status
+ * @work: The work structure
+ *
+ * In polled mode we bypass the PLIC entirely and periodically call the
+ * IRQ handler to check for pending events (RX packets, TX done, link
+ * change, etc.).  The KSZ8851 ISR bits are set by hardware regardless
+ * of the IER setting, so this works even with chip interrupts disabled.
+ */
+static void ks8851_poll_work(struct work_struct *work)
+{
+	struct ks8851_net *ks = container_of(work, struct ks8851_net,
+					     poll_work.work);
+
+	ks8851_irq(0, ks);
+
+	if (netif_running(ks->netdev))
+		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(20));
 }
 
 /**
@@ -406,15 +429,12 @@ static int ks8851_net_open(struct net_device *dev)
 {
 	struct ks8851_net *ks = netdev_priv(dev);
 	unsigned long flags;
-	int ret;
 
-	ret = request_threaded_irq(dev->irq, NULL, ks8851_irq,
-				   IRQF_TRIGGER_LOW | IRQF_ONESHOT,
-				   dev->name, ks);
-	if (ret < 0) {
-		netdev_err(dev, "failed to get irq\n");
-		return ret;
-	}
+	/* Polled mode: bypass the PLIC entirely.  Keep IER=0 so the chip
+	 * never asserts its IRQ pin.  ISR bits are still set by hardware
+	 * and will be read by the poll worker. */
+	ks->rc_ier = 0;
+	INIT_DELAYED_WORK(&ks->poll_work, ks8851_poll_work);
 
 	/* lock the card, even if we may not actually be doing anything
 	 * else at the moment */
@@ -461,9 +481,9 @@ static int ks8851_net_open(struct net_device *dev)
 
 	ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
 
-	/* clear then enable interrupts */
-	ks8851_wrreg16(ks, KS_ISR, ks->rc_ier);
-	ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+	/* clear all pending interrupts; keep IER=0 for polled mode */
+	ks8851_wrreg16(ks, KS_ISR, 0xFFFF);
+	ks8851_wrreg16(ks, KS_IER, 0x0000);
 
 	ks->queued_len = 0;
 	ks->tx_space = ks8851_rdreg16(ks, KS_TXMIR);
@@ -472,7 +492,12 @@ static int ks8851_net_open(struct net_device *dev)
 	netif_dbg(ks, ifup, ks->netdev, "network device up\n");
 
 	ks8851_unlock(ks, &flags);
-	mii_check_link(&ks->mii);
+	netif_carrier_on(ks->netdev);
+
+	/* Start polling at 50Hz */
+	schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(20));
+	netdev_info(dev, "using polled mode (20ms interval)\n");
+
 	return 0;
 }
 
@@ -524,7 +549,7 @@ static int ks8851_net_stop(struct net_device *dev)
 		dev_kfree_skb(txb);
 	}
 
-	free_irq(dev->irq, ks);
+	cancel_delayed_work_sync(&ks->poll_work);
 
 	return 0;
 }
@@ -1095,10 +1120,12 @@ int ks8851_probe_common(struct net_device *netdev, struct device *dev,
 		return ret;
 	}
 
-	ret = gpiod_set_consumer_name(ks->gpio, "ks8851_rst_n");
-	if (ret) {
-		dev_err(dev, "failed to set reset gpio name: %d\n", ret);
-		return ret;
+	if (ks->gpio) {
+		ret = gpiod_set_consumer_name(ks->gpio, "ks8851_rst_n");
+		if (ret) {
+			dev_err(dev, "failed to set reset gpio name: %d\n", ret);
+			return ret;
+		}
 	}
 
 	ks->vdd_io = devm_regulator_get(dev, "vdd-io");

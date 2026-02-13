@@ -37,6 +37,38 @@
 
 int show_unhandled_signals = 1;
 
+/*
+ * Sonata debug: syscall trace ring buffer.
+ * Avoids printk (which corrupts on Ibex due to emulated atomics).
+ * Read via GDB:  print sonata_sc_ring[0]@64
+ *   or: x/256xw &sonata_sc_ring
+ * Toggle via GDB:  set sonata_syscall_trace = 1
+ */
+int sonata_syscall_trace __read_mostly;
+
+/*
+ * Called when access_ok() rejects a user pointer.
+ * Noinline so GDB can: break __access_ok_fault
+ */
+noinline int __access_ok_fault(unsigned long addr, unsigned long size)
+{
+	pr_warn("access_ok REJECT: addr=%lx size=%lx pid=%d\n",
+		addr, size, current->pid);
+	return 0;
+}
+
+#define SC_RING_SIZE 64
+struct sc_entry {
+	unsigned long nr;	/* syscall number */
+	unsigned long a0;	/* first arg */
+	unsigned long a1;	/* second arg */
+	unsigned long ret;	/* return value (filled after) */
+	unsigned long epc;	/* user PC */
+	unsigned long pid;	/* current->pid */
+};
+struct sc_entry sonata_sc_ring[SC_RING_SIZE];
+unsigned int sonata_sc_idx;
+
 static DEFINE_RAW_SPINLOCK(die_lock);
 
 static int copy_code(struct pt_regs *regs, u16 *val, const u16 *insns)
@@ -158,9 +190,25 @@ asmlinkage __visible __trap_section void name(struct pt_regs *regs)		\
 		local_irq_disable();						\
 		irqentry_exit_to_user_mode(regs);				\
 	} else {								\
-		irqentry_state_t state = irqentry_nmi_enter(regs);		\
-		do_trap_error(regs, signo, code, regs->epc, "Oops - " str);	\
-		irqentry_nmi_exit(regs, state);					\
+		/* Check exception table first (_nofault functions). */		\
+		if (fixup_exception(regs))					\
+			return;							\
+		/* Print essential info before die() can re-fault. */		\
+		pr_emerg(str ": epc=%08lx badaddr=%08lx ra=%08lx\n",		\
+			 regs->epc, regs->badaddr, regs->ra);			\
+		/* Prevent infinite recursion: die() crash dumps can		\
+		 * themselves fault on nommu systems. */				\
+		if (panic_on_oops || oops_in_progress > 1) {			\
+			pr_emerg("Recursive fault, halting.\n");		\
+			while (1)						\
+				cpu_relax();					\
+		}								\
+		{								\
+			irqentry_state_t state = irqentry_nmi_enter(regs);	\
+			do_trap_error(regs, signo, code, regs->epc,		\
+				      "Oops - " str);				\
+			irqentry_nmi_exit(regs, state);				\
+		}								\
 	}									\
 }
 
@@ -340,8 +388,21 @@ void do_trap_ecall_u(struct pt_regs *regs)
 
 		add_random_kstack_offset();
 
-		if (syscall >= 0 && syscall < NR_syscalls)
+		if (syscall >= 0 && syscall < NR_syscalls) {
+			unsigned int __idx = 0;
+			if (unlikely(sonata_syscall_trace)) {
+				__idx = sonata_sc_idx++ % SC_RING_SIZE;
+				sonata_sc_ring[__idx].nr  = syscall;
+				sonata_sc_ring[__idx].a0  = regs->orig_a0;
+				sonata_sc_ring[__idx].a1  = regs->a1;
+				sonata_sc_ring[__idx].epc = regs->epc - 4;
+				sonata_sc_ring[__idx].pid = current->pid;
+				sonata_sc_ring[__idx].ret = 0xdeadbeef;
+			}
 			syscall_handler(regs, syscall);
+			if (unlikely(sonata_syscall_trace))
+				sonata_sc_ring[__idx].ret = regs->a0;
+		}
 
 		/*
 		 * Ultimately, this value will get limited by KSTACK_OFFSET_MAX(),

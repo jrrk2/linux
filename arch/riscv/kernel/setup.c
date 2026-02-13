@@ -313,8 +313,30 @@ static void __init riscv_spinlock_init(void)
 
 extern void __init init_rt_signal_env(void);
 
+/* Expected .text checksum — patched into vmlinux by scripts/patch_text_checksum.py */
+u32 expected_text_checksum __section(".data") = 0;
+
 void __init setup_arch(char **cmdline_p)
 {
+	/* Checksum kernel .text to detect HyperRAM corruption */
+	{
+		const u32 *p = (const u32 *)_stext;
+		const u32 *end = (const u32 *)_etext;
+		u32 sum = 0;
+
+		while (p < end)
+			sum += *p++;
+		if (expected_text_checksum && sum != expected_text_checksum)
+			pr_emerg("TEXT CHECKSUM MISMATCH: got 0x%08x expected 0x%08x\n",
+				 sum, expected_text_checksum);
+		else if (expected_text_checksum)
+			pr_info("text checksum: 0x%08x OK (%u bytes)\n",
+				sum, (unsigned int)(_etext - _stext));
+		else
+			pr_info("text checksum: 0x%08x (%u bytes) [no expected value]\n",
+				sum, (unsigned int)(_etext - _stext));
+	}
+
 	parse_dtb();
 	setup_initial_init_mm(_stext, _etext, _edata, _end);
 

@@ -362,12 +362,14 @@ static void thread_stack_delayed_free(struct task_struct *tsk)
 /*
  * Sonata SRAM stack pool — avoid HyperRAM for thread stacks.
  * SRAM: 0x00100000–0x00120000 (128KB).
+ * Bottom of SRAM holds printk ring buffer (.sram.data section),
+ * ending at __sram_end (aligned to THREAD_SIZE by the linker script).
  * Top 8KB (0x0011e000–0x00120000) reserved for idle task (init_task).
- * THREAD_SIZE = 8KB → 15 stacks available for other threads.
  */
-#define SRAM_STACK_BASE	0x00100000UL
+extern char __sram_end[];
+#define SRAM_STACK_BASE	((unsigned long)__sram_end)
 #define SRAM_STACK_END	0x0011e000UL
-static unsigned long sram_stack_next = SRAM_STACK_BASE;
+static unsigned long sram_stack_next;
 
 static inline bool is_sram_stack(void *stack)
 {
@@ -377,6 +379,10 @@ static inline bool is_sram_stack(void *stack)
 
 static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
+	/* Lazy-init: set base to end of printk .sram.data section */
+	if (!sram_stack_next)
+		sram_stack_next = SRAM_STACK_BASE;
+
 	/* Try SRAM first */
 	if (sram_stack_next + THREAD_SIZE <= SRAM_STACK_END) {
 		tsk->stack = (void *)sram_stack_next;

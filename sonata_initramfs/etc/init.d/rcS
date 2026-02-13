@@ -1,16 +1,11 @@
 #!/bin/sh
 
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
 echo "========================================"
 echo "  Sonata Linux - lowRISC Ibex RV32IMC"
 echo "  nommu, M-mode, single hart"
 echo "========================================"
-echo
-
-echo "Testing ls (NOEXEC applet)..."
-ls /
-
-echo "Testing uname (NOEXEC applet)..."
 uname -a
-
-echo "Welcome to Sonata Linux!"
 echo

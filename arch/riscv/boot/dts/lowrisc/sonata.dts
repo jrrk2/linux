@@ -15,7 +15,7 @@
 	model = "lowRISC Sonata";
 
 	chosen {
-		bootargs = "earlycon console=ttyOT0";
+		bootargs = "earlycon console=ttyOT0 init=/bin/sh";
 		stdout-path = &uart0;
 	};
 
@@ -109,6 +109,13 @@
 				spi-max-frequency = <25000000>;
 				interrupt-parent = <&plic>;
 				interrupts = <2>;
+			};
+
+			/* CS[1] is wired to KSZ8851 reset — keep as dummy */
+			ethmac_rst: reset@1 {
+				compatible = "lowrisc,sonata-eth-reset";
+				reg = <1>;
+				status = "disabled";
 			};
 		};
 

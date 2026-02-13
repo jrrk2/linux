@@ -478,6 +478,42 @@ static inline void user_access_restore(unsigned long enabled) { }
 		goto label;
 
 #else /* CONFIG_MMU */
+
+/*
+ * nommu: Override __access_ok so user pointers are validated against
+ * physical memory.  Without this, any bad pointer from userspace
+ * directly hits the bus — on TileLink that's a permanent lockup.
+ *
+ * Cannot include memblock.h here (circular), so declare max_low_pfn
+ * directly.  PFN_PHYS() comes from asm/page.h via asm/pgtable.h.
+ */
+extern unsigned long max_low_pfn;
+extern int __access_ok_fault(unsigned long addr, unsigned long size);
+
+static inline int __access_ok(const void __user *ptr, unsigned long size)
+{
+	unsigned long addr = (unsigned long)ptr;
+	unsigned long end  = addr + size;
+
+	if (unlikely(!size))			/* zero-length is always ok */
+		return 1;
+
+	if (unlikely(end < addr))		/* wraparound */
+		return __access_ok_fault(addr, size);
+
+	/* Allow main RAM (HyperRAM) range */
+	if (likely(addr >= CONFIG_PHYS_RAM_BASE &&
+		   end <= (max_low_pfn << PAGE_SHIFT)))
+		return 1;
+
+	/* Allow SRAM range (stacks, etc.) */
+	if (addr >= 0x00100000UL && end <= 0x00120000UL)
+		return 1;
+
+	return __access_ok_fault(addr, size);
+}
+#define __access_ok __access_ok
+
 #include <asm-generic/uaccess.h>
 #endif /* CONFIG_MMU */
 #endif /* _ASM_RISCV_UACCESS_H */

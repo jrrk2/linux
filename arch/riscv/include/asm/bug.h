@@ -70,6 +70,27 @@ do {								\
 		  "i" (sizeof(struct bug_entry)));              \
 } while (0)
 
+/*
+ * Sonata/Ibex: GDB is always connected via JTAG, so ebreak traps into
+ * the debug unit instead of the kernel's M-mode trap handler.  Use nop
+ * instead of ebreak so WARN() just prints and continues.
+ */
+#define __WARN_FLAGS(flags)					\
+do {								\
+	__asm__ __volatile__ (					\
+		"1:\n\t"					\
+		"nop\n"						\
+		".pushsection __bug_table,\"aw\"\n\t"		\
+		"2:\n\t"					\
+		__BUG_ENTRY("%0", "%1", "%2") "\n\t"		\
+		".org 2b + %3\n\t"				\
+		".popsection"					\
+		:						\
+		: "i" (__FILE__), "i" (__LINE__),		\
+		  "i" (BUGFLAG_WARNING|(flags)),		\
+		  "i" (sizeof(struct bug_entry)));		\
+} while (0)
+
 #else /* CONFIG_GENERIC_BUG */
 #define __BUG_FLAGS(flags) do {					\
 	__asm__ __volatile__ ("ebreak\n");			\
@@ -81,7 +102,7 @@ do {								\
 	unreachable();						\
 } while (0)
 
-#define __WARN_FLAGS(flags) __BUG_FLAGS(BUGFLAG_WARNING|(flags))
+/* __WARN_FLAGS defined above with nop instead of ebreak */
 
 #define ARCH_WARN_REACHABLE
 

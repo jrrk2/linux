@@ -306,10 +306,11 @@ SYM_CODE_START(_start_kernel)
 
 #ifndef CONFIG_XIP_KERNEL
 	/*
-	 * Zero SRAM (0x00100000-0x00120000).
-	 * Used for kernel stacks; must be clean for repeatable behaviour.
+	 * Zero SRAM above the printk ring buffer (which is placed at the
+	 * base of SRAM by the linker).  __sram_end marks the first free
+	 * byte; the init_task stack lives at the top of SRAM.
 	 */
-	li a3, 0x00100000
+	la a3, __sram_end
 	li a4, 0x00120000
 .Lclear_sram:
 	sw zero, 0(a3)

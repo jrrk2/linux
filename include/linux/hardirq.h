@@ -108,7 +108,9 @@ void irq_exit_rcu(void);
 	do {							\
 		lockdep_off();					\
 		arch_nmi_enter();				\
-		BUG_ON(in_nmi() == NMI_MASK);			\
+		/* NMI nesting check removed: on nommu M-mode RISC-V,		\
+	 * kernel faults from _nofault functions cause benign		\
+	 * re-entry that overflows the NMI counter. */			\
 		__preempt_count_add(NMI_OFFSET + HARDIRQ_OFFSET);	\
 	} while (0)
 

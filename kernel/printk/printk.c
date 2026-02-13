@@ -500,9 +500,6 @@ static struct latched_seq clear_seq = {
 #define LOG_ALIGN __alignof__(unsigned long)
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
 #define LOG_BUF_LEN_MAX ((u32)1 << 31)
-static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
-static char *log_buf = __log_buf;
-static u32 log_buf_len = __LOG_BUF_LEN;
 
 /*
  * Define the average message size. This only affects the number of
@@ -514,8 +511,59 @@ static u32 log_buf_len = __LOG_BUF_LEN;
 #if CONFIG_LOG_BUF_SHIFT <= PRB_AVGBITS
 #error CONFIG_LOG_BUF_SHIFT value too small.
 #endif
-_DEFINE_PRINTKRB(printk_rb_static, CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS,
-		 PRB_AVGBITS, &__log_buf[0]);
+
+/*
+ * On Sonata (nommu, M-mode, HyperRAM), place the printk ring buffer
+ * and all its data structures in SRAM to avoid potential HyperRAM
+ * caching/coherency issues with the lock-free ring buffer operations.
+ *
+ * The .sram.data section is placed at 0x00100000 by the linker script.
+ * head.S skips this region when zeroing SRAM for the kernel stack.
+ */
+#if defined(CONFIG_RISCV_M_MODE) && !defined(CONFIG_MMU)
+#define __printk_sram __section(".sram.data")
+#else
+#define __printk_sram
+#endif
+
+static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN) __printk_sram = {};
+static char *log_buf = __log_buf;
+static u32 log_buf_len = __LOG_BUF_LEN;
+
+/* Manually expanded _DEFINE_PRINTKRB with optional SRAM section attribute */
+static struct prb_desc _printk_rb_static_descs[_DESCS_COUNT(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS)]
+		__printk_sram = {
+	[_DESCS_COUNT(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS) - 1] = {
+		.state_var = ATOMIC_INIT(DESC0_SV(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS)),
+		.text_blk_lpos = FAILED_BLK_LPOS,
+	},
+};
+static struct printk_info _printk_rb_static_infos[_DESCS_COUNT(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS)]
+		__printk_sram = {
+	[0] = {
+		.seq = -(u64)_DESCS_COUNT(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS),
+	},
+	[_DESCS_COUNT(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS) - 1] = {
+		.seq = 0,
+	},
+};
+static struct printk_ringbuffer printk_rb_static __printk_sram = {
+	.desc_ring = {
+		.count_bits = CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS,
+		.descs = &_printk_rb_static_descs[0],
+		.infos = &_printk_rb_static_infos[0],
+		.head_id = ATOMIC_INIT(DESC0_ID(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS)),
+		.tail_id = ATOMIC_INIT(DESC0_ID(CONFIG_LOG_BUF_SHIFT - PRB_AVGBITS)),
+		.last_finalized_seq = ATOMIC_INIT(0),
+	},
+	.text_data_ring = {
+		.size_bits = CONFIG_LOG_BUF_SHIFT,
+		.data = &__log_buf[0],
+		.head_lpos = ATOMIC_LONG_INIT(BLK0_LPOS(CONFIG_LOG_BUF_SHIFT)),
+		.tail_lpos = ATOMIC_LONG_INIT(BLK0_LPOS(CONFIG_LOG_BUF_SHIFT)),
+	},
+	.fail = ATOMIC_LONG_INIT(0),
+};
 
 static struct printk_ringbuffer printk_rb_dynamic;
 
@@ -2188,6 +2236,10 @@ static u16 printk_sprint(char *text, u16 size, int facility,
 			 va_list args)
 {
 	u16 text_len;
+
+	/* Guard against corrupted ring buffer returning NULL text_buf */
+	if (!text || !size)
+		return 0;
 
 	text_len = vscnprintf(text, size, fmt, args);
 

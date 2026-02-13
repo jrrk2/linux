@@ -125,6 +125,9 @@ extern void irq_unlock_sparse(void);
 #else
 static inline void irq_lock_sparse(void) { }
 static inline void irq_unlock_sparse(void) { }
+#ifndef NR_IRQS
+#define NR_IRQS 64
+#endif
 extern struct irq_desc irq_desc[NR_IRQS];
 #endif
 
