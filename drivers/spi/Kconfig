@@ -70,6 +70,15 @@ config SPI_AIROHA_SNFI
 	  Flash Interface found on Airoha ARM SoCs. This controller
 	  is implemented as a SPI-MEM controller.
 
+config SPI_OPENTITAN
+	tristate "OpenTitan SPI host controller (lowRISC Sonata)"
+	depends on HAS_IOMEM
+	depends on OF || COMPILE_TEST
+	help
+	  SPI host controller driver for the OpenTitan SPI IP block,
+	  as used in the lowRISC Sonata RISC-V system. Polled FIFO-based
+	  operation with manual chip-select control.
+
 config SPI_ALTERA
 	tristate "Altera SPI Controller platform driver"
 	select SPI_ALTERA_CORE

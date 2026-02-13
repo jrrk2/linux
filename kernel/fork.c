@@ -359,20 +359,51 @@ static void thread_stack_delayed_free(struct task_struct *tsk)
 	call_rcu(rh, thread_stack_free_rcu);
 }
 
+/*
+ * Sonata SRAM stack pool — avoid HyperRAM for thread stacks.
+ * SRAM: 0x00100000–0x00120000 (128KB).
+ * Top 8KB (0x0011e000–0x00120000) reserved for idle task (init_task).
+ * THREAD_SIZE = 8KB → 15 stacks available for other threads.
+ */
+#define SRAM_STACK_BASE	0x00100000UL
+#define SRAM_STACK_END	0x0011e000UL
+static unsigned long sram_stack_next = SRAM_STACK_BASE;
+
+static inline bool is_sram_stack(void *stack)
+{
+	unsigned long addr = (unsigned long)stack;
+	return addr >= SRAM_STACK_BASE && addr < (SRAM_STACK_END + THREAD_SIZE);
+}
+
 static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
-	struct page *page = alloc_pages_node(node, THREADINFO_GFP,
-					     THREAD_SIZE_ORDER);
-
-	if (likely(page)) {
-		tsk->stack = kasan_reset_tag(page_address(page));
+	/* Try SRAM first */
+	if (sram_stack_next + THREAD_SIZE <= SRAM_STACK_END) {
+		tsk->stack = (void *)sram_stack_next;
+		sram_stack_next += THREAD_SIZE;
+		memset(tsk->stack, 0, THREAD_SIZE);
 		return 0;
+	}
+
+	/* Fall back to page allocator (HyperRAM) */
+	{
+		struct page *page = alloc_pages_node(node, THREADINFO_GFP,
+						     THREAD_SIZE_ORDER);
+		if (likely(page)) {
+			tsk->stack = kasan_reset_tag(page_address(page));
+			return 0;
+		}
 	}
 	return -ENOMEM;
 }
 
 static void free_thread_stack(struct task_struct *tsk)
 {
+	/* SRAM stacks are never freed — just leak them */
+	if (is_sram_stack(tsk->stack)) {
+		tsk->stack = NULL;
+		return;
+	}
 	thread_stack_delayed_free(tsk);
 	tsk->stack = NULL;
 }
@@ -445,6 +476,10 @@ static void account_kernel_stack(struct task_struct *tsk, int account)
 					      account * (PAGE_SIZE / 1024));
 	} else {
 		void *stack = task_stack_page(tsk);
+
+		/* SRAM stacks aren't in the page allocator — skip accounting */
+		if (is_sram_stack(stack))
+			return;
 
 		/* All stack pages are in the same node. */
 		mod_lruvec_kmem_state(stack, NR_KERNEL_STACK_KB,

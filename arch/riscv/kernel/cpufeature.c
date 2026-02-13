@@ -797,7 +797,6 @@ static void __init riscv_fill_hwcap_from_isa_string(unsigned long *isa2hwcap)
 
 	boot_vendorid = riscv_get_mvendorid();
 	boot_archid = riscv_get_marchid();
-
 	for_each_possible_cpu(cpu) {
 		struct riscv_isainfo *isainfo = &hart_isa[cpu];
 		unsigned long this_hwcap = 0;
@@ -981,7 +980,6 @@ static int __init riscv_fill_hwcap_from_ext_list(unsigned long *isa2hwcap)
 
 		cpu_node = of_cpu_device_node_get(cpu);
 		if (!cpu_node) {
-			pr_warn("Unable to find cpu node\n");
 			continue;
 		}
 
@@ -1071,7 +1069,6 @@ void __init riscv_fill_hwcap(void)
 		int ret = riscv_fill_hwcap_from_ext_list(isa2hwcap);
 
 		if (ret && riscv_isa_fallback) {
-			pr_info("Falling back to deprecated \"riscv,isa\"\n");
 			riscv_fill_hwcap_from_isa_string(isa2hwcap);
 		}
 	}

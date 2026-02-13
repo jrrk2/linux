@@ -5,6 +5,7 @@
 #ifndef ASM_ERRATA_LIST_H
 #define ASM_ERRATA_LIST_H
 
+#include <asm/alternative-macros.h>
 #include <asm/csr.h>
 #include <asm/insn-def.h>
 #include <asm/hwcap.h>

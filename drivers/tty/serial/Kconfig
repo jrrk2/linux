@@ -1545,6 +1545,25 @@ config SERIAL_LITEUART_CONSOLE
 	  and warnings and which allows logins in single user mode).
 	  Otherwise, say 'N'.
 
+config SERIAL_OPENTITAN
+	tristate "OpenTitan UART support (lowRISC Sonata)"
+	depends on HAS_IOMEM
+	depends on OF || COMPILE_TEST
+	select SERIAL_CORE
+	help
+	  Driver for the OpenTitan UART IP block used in the lowRISC Sonata
+	  RISC-V system. Say Y or M here if your system has an OpenTitan UART.
+
+config SERIAL_OPENTITAN_CONSOLE
+	bool "OpenTitan UART console support"
+	depends on SERIAL_OPENTITAN=y
+	select SERIAL_CORE_CONSOLE
+	select SERIAL_EARLYCON
+	help
+	  Say Y here to use the OpenTitan UART as the system console
+	  (the device which receives all kernel messages and allows logins
+	  in single user mode). Also enables earlycon for early boot output.
+
 config SERIAL_SUNPLUS
 	tristate "Sunplus UART support"
 	depends on ARCH_SUNPLUS || COMPILE_TEST

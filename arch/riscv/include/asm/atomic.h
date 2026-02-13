@@ -3,6 +3,8 @@
  * Copyright (C) 2007 Red Hat, Inc. All Rights Reserved.
  * Copyright (C) 2012 Regents of the University of California
  * Copyright (C) 2017 SiFive
+ *
+ * IRQ-safe (non-AMO) atomics for single-hart cores without the A extension.
  */
 
 #ifndef _ASM_RISCV_ATOMIC_H
@@ -17,20 +19,22 @@
 #endif
 
 #include <asm/cmpxchg.h>
+#include <linux/irqflags.h>
 
-#define __atomic_acquire_fence()					\
-	__asm__ __volatile__(RISCV_ACQUIRE_BARRIER "" ::: "memory")
-
-#define __atomic_release_fence()					\
-	__asm__ __volatile__(RISCV_RELEASE_BARRIER "" ::: "memory");
+#define __atomic_acquire_fence()	__cmpxchg_fence()
+#define __atomic_release_fence()	__cmpxchg_fence()
 
 static __always_inline int arch_atomic_read(const atomic_t *v)
 {
-	return READ_ONCE(v->counter);
+	int val;
+	__cmpxchg_fence();
+	val = READ_ONCE(v->counter);
+	return val;
 }
 static __always_inline void arch_atomic_set(atomic_t *v, int i)
 {
 	WRITE_ONCE(v->counter, i);
+	__cmpxchg_fence();
 }
 
 #ifndef CONFIG_GENERIC_ATOMIC64
@@ -46,96 +50,90 @@ static __always_inline void arch_atomic64_set(atomic64_t *v, s64 i)
 #endif
 
 /*
- * First, the atomic ops that have no ordering constraints and therefor don't
- * have the AQ or RL bits set.  These don't return anything, so there's only
- * one version to worry about.
+ * IRQ-safe atomic operations for single-hart systems.
+ * Disabling interrupts guarantees atomicity since there is no other hart.
  */
-#define ATOMIC_OP(op, asm_op, I, asm_type, c_type, prefix)		\
+
+/* Fire-and-forget ops: add, sub, and, or, xor */
+#define ATOMIC_OP(op, c_op, I, c_type, prefix)				\
 static __always_inline							\
 void arch_atomic##prefix##_##op(c_type i, atomic##prefix##_t *v)	\
 {									\
-	__asm__ __volatile__ (						\
-		"	amo" #asm_op "." #asm_type " zero, %1, %0"	\
-		: "+A" (v->counter)					\
-		: "r" (I)						\
-		: "memory");						\
-}									\
+	unsigned long __flags;						\
+	raw_local_irq_save(__flags);					\
+	__cmpxchg_fence();						\
+	v->counter = v->counter c_op (I);				\
+	__cmpxchg_fence();						\
+	raw_local_irq_restore(__flags);					\
+}
 
 #ifdef CONFIG_GENERIC_ATOMIC64
-#define ATOMIC_OPS(op, asm_op, I)					\
-        ATOMIC_OP (op, asm_op, I, w, int,   )
+#define ATOMIC_OPS(op, c_op, I)						\
+	ATOMIC_OP(op, c_op, I, int,   )
 #else
-#define ATOMIC_OPS(op, asm_op, I)					\
-        ATOMIC_OP (op, asm_op, I, w, int,   )				\
-        ATOMIC_OP (op, asm_op, I, d, s64, 64)
+#define ATOMIC_OPS(op, c_op, I)						\
+	ATOMIC_OP(op, c_op, I, int,   )				\
+	ATOMIC_OP(op, c_op, I, s64, 64)
 #endif
 
-ATOMIC_OPS(add, add,  i)
-ATOMIC_OPS(sub, add, -i)
-ATOMIC_OPS(and, and,  i)
-ATOMIC_OPS( or,  or,  i)
-ATOMIC_OPS(xor, xor,  i)
+ATOMIC_OPS(add, +,  i)
+ATOMIC_OPS(sub, +, -i)
+ATOMIC_OPS(and, &,  i)
+ATOMIC_OPS( or, |,  i)
+ATOMIC_OPS(xor, ^,  i)
 
 #undef ATOMIC_OP
 #undef ATOMIC_OPS
 
-/*
- * Atomic ops that have ordered, relaxed, acquire, and release variants.
- * There's two flavors of these: the arithmatic ops have both fetch and return
- * versions, while the logical ops only have fetch versions.
- */
-#define ATOMIC_FETCH_OP(op, asm_op, I, asm_type, c_type, prefix)	\
+/* Fetch ops (return OLD value) and return ops (return NEW value) */
+#define ATOMIC_FETCH_OP(op, c_op, I, c_type, prefix)			\
 static __always_inline							\
 c_type arch_atomic##prefix##_fetch_##op##_relaxed(c_type i,		\
 					     atomic##prefix##_t *v)	\
 {									\
-	register c_type ret;						\
-	__asm__ __volatile__ (						\
-		"	amo" #asm_op "." #asm_type " %1, %2, %0"	\
-		: "+A" (v->counter), "=r" (ret)				\
-		: "r" (I)						\
-		: "memory");						\
-	return ret;							\
+	c_type __ret;							\
+	unsigned long __flags;						\
+	raw_local_irq_save(__flags);					\
+	__cmpxchg_fence();						\
+	__ret = v->counter;						\
+	v->counter = __ret c_op (I);					\
+	__cmpxchg_fence();						\
+	raw_local_irq_restore(__flags);					\
+	return __ret;							\
 }									\
 static __always_inline							\
-c_type arch_atomic##prefix##_fetch_##op(c_type i, atomic##prefix##_t *v)	\
+c_type arch_atomic##prefix##_fetch_##op(c_type i, atomic##prefix##_t *v) \
 {									\
-	register c_type ret;						\
-	__asm__ __volatile__ (						\
-		"	amo" #asm_op "." #asm_type ".aqrl  %1, %2, %0"	\
-		: "+A" (v->counter), "=r" (ret)				\
-		: "r" (I)						\
-		: "memory");						\
-	return ret;							\
+	return arch_atomic##prefix##_fetch_##op##_relaxed(i, v);	\
 }
 
-#define ATOMIC_OP_RETURN(op, asm_op, c_op, I, asm_type, c_type, prefix)	\
+#define ATOMIC_OP_RETURN(op, c_op, I, c_type, prefix)			\
 static __always_inline							\
 c_type arch_atomic##prefix##_##op##_return_relaxed(c_type i,		\
 					      atomic##prefix##_t *v)	\
 {									\
-        return arch_atomic##prefix##_fetch_##op##_relaxed(i, v) c_op I;	\
+	return arch_atomic##prefix##_fetch_##op##_relaxed(i, v) c_op (I); \
 }									\
 static __always_inline							\
-c_type arch_atomic##prefix##_##op##_return(c_type i, atomic##prefix##_t *v)	\
+c_type arch_atomic##prefix##_##op##_return(c_type i, atomic##prefix##_t *v) \
 {									\
-        return arch_atomic##prefix##_fetch_##op(i, v) c_op I;		\
+	return arch_atomic##prefix##_fetch_##op(i, v) c_op (I);	\
 }
 
 #ifdef CONFIG_GENERIC_ATOMIC64
-#define ATOMIC_OPS(op, asm_op, c_op, I)					\
-        ATOMIC_FETCH_OP( op, asm_op,       I, w, int,   )		\
-        ATOMIC_OP_RETURN(op, asm_op, c_op, I, w, int,   )
+#define ATOMIC_OPS(op, c_op, I)						\
+        ATOMIC_FETCH_OP( op, c_op, I, int,   )				\
+        ATOMIC_OP_RETURN(op, c_op, I, int,   )
 #else
-#define ATOMIC_OPS(op, asm_op, c_op, I)					\
-        ATOMIC_FETCH_OP( op, asm_op,       I, w, int,   )		\
-        ATOMIC_OP_RETURN(op, asm_op, c_op, I, w, int,   )		\
-        ATOMIC_FETCH_OP( op, asm_op,       I, d, s64, 64)		\
-        ATOMIC_OP_RETURN(op, asm_op, c_op, I, d, s64, 64)
+#define ATOMIC_OPS(op, c_op, I)						\
+        ATOMIC_FETCH_OP( op, c_op, I, int,   )				\
+        ATOMIC_OP_RETURN(op, c_op, I, int,   )				\
+        ATOMIC_FETCH_OP( op, c_op, I, s64, 64)				\
+        ATOMIC_OP_RETURN(op, c_op, I, s64, 64)
 #endif
 
-ATOMIC_OPS(add, add, +,  i)
-ATOMIC_OPS(sub, add, +, -i)
+ATOMIC_OPS(add, +,  i)
+ATOMIC_OPS(sub, +, -i)
 
 #define arch_atomic_add_return_relaxed	arch_atomic_add_return_relaxed
 #define arch_atomic_sub_return_relaxed	arch_atomic_sub_return_relaxed
@@ -162,17 +160,17 @@ ATOMIC_OPS(sub, add, +, -i)
 #undef ATOMIC_OPS
 
 #ifdef CONFIG_GENERIC_ATOMIC64
-#define ATOMIC_OPS(op, asm_op, I)					\
-        ATOMIC_FETCH_OP(op, asm_op, I, w, int,   )
+#define ATOMIC_OPS(op, c_op, I)						\
+        ATOMIC_FETCH_OP(op, c_op, I, int,   )
 #else
-#define ATOMIC_OPS(op, asm_op, I)					\
-        ATOMIC_FETCH_OP(op, asm_op, I, w, int,   )			\
-        ATOMIC_FETCH_OP(op, asm_op, I, d, s64, 64)
+#define ATOMIC_OPS(op, c_op, I)						\
+        ATOMIC_FETCH_OP(op, c_op, I, int,   )				\
+        ATOMIC_FETCH_OP(op, c_op, I, s64, 64)
 #endif
 
-ATOMIC_OPS(and, and, i)
-ATOMIC_OPS( or,  or, i)
-ATOMIC_OPS(xor, xor, i)
+ATOMIC_OPS(and, &, i)
+ATOMIC_OPS( or, |, i)
+ATOMIC_OPS(xor, ^, i)
 
 #define arch_atomic_fetch_and_relaxed	arch_atomic_fetch_and_relaxed
 #define arch_atomic_fetch_or_relaxed	arch_atomic_fetch_or_relaxed
@@ -191,32 +189,23 @@ ATOMIC_OPS(xor, xor, i)
 #endif
 
 #undef ATOMIC_OPS
-
 #undef ATOMIC_FETCH_OP
 #undef ATOMIC_OP_RETURN
 
-#define _arch_atomic_fetch_add_unless(_prev, _rc, counter, _a, _u, sfx)	\
-({									\
-	__asm__ __volatile__ (						\
-		"0:	lr." sfx "     %[p],  %[c]\n"			\
-		"	beq	       %[p],  %[u], 1f\n"		\
-		"	add            %[rc], %[p], %[a]\n"		\
-		"	sc." sfx ".rl  %[rc], %[rc], %[c]\n"		\
-		"	bnez           %[rc], 0b\n"			\
-		"	fence          rw, rw\n"			\
-		"1:\n"							\
-		: [p]"=&r" (_prev), [rc]"=&r" (_rc), [c]"+A" (counter)	\
-		: [a]"r" (_a), [u]"r" (_u)				\
-		: "memory");						\
-})
-
-/* This is required to provide a full barrier on success. */
+/* fetch_add_unless: add unless the value equals u */
 static __always_inline int arch_atomic_fetch_add_unless(atomic_t *v, int a, int u)
 {
-       int prev, rc;
+	int prev;
+	unsigned long flags;
 
-	_arch_atomic_fetch_add_unless(prev, rc, v->counter, a, u, "w");
-
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	if (prev != u) {
+		v->counter = prev + a;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
 	return prev;
 }
 #define arch_atomic_fetch_add_unless arch_atomic_fetch_add_unless
@@ -224,129 +213,125 @@ static __always_inline int arch_atomic_fetch_add_unless(atomic_t *v, int a, int 
 #ifndef CONFIG_GENERIC_ATOMIC64
 static __always_inline s64 arch_atomic64_fetch_add_unless(atomic64_t *v, s64 a, s64 u)
 {
-       s64 prev;
-       long rc;
+	s64 prev;
+	unsigned long flags;
 
-	_arch_atomic_fetch_add_unless(prev, rc, v->counter, a, u, "d");
-
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	if (prev != u) {
+		v->counter = prev + a;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
 	return prev;
 }
 #define arch_atomic64_fetch_add_unless arch_atomic64_fetch_add_unless
 #endif
 
-#define _arch_atomic_inc_unless_negative(_prev, _rc, counter, sfx)	\
-({									\
-	__asm__ __volatile__ (						\
-		"0:	lr." sfx "      %[p],  %[c]\n"			\
-		"	bltz            %[p],  1f\n"			\
-		"	addi            %[rc], %[p], 1\n"		\
-		"	sc." sfx ".rl   %[rc], %[rc], %[c]\n"		\
-		"	bnez            %[rc], 0b\n"			\
-		"	fence           rw, rw\n"			\
-		"1:\n"							\
-		: [p]"=&r" (_prev), [rc]"=&r" (_rc), [c]"+A" (counter)	\
-		:							\
-		: "memory");						\
-})
-
 static __always_inline bool arch_atomic_inc_unless_negative(atomic_t *v)
 {
-	int prev, rc;
+	int prev;
+	unsigned long flags;
 
-	_arch_atomic_inc_unless_negative(prev, rc, v->counter, "w");
-
-	return !(prev < 0);
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	if (prev >= 0) {
+		v->counter = prev + 1;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
+	return prev >= 0;
 }
-
 #define arch_atomic_inc_unless_negative arch_atomic_inc_unless_negative
-
-#define _arch_atomic_dec_unless_positive(_prev, _rc, counter, sfx)	\
-({									\
-	__asm__ __volatile__ (						\
-		"0:	lr." sfx "      %[p],  %[c]\n"			\
-		"	bgtz            %[p],  1f\n"			\
-		"	addi            %[rc], %[p], -1\n"		\
-		"	sc." sfx ".rl   %[rc], %[rc], %[c]\n"		\
-		"	bnez            %[rc], 0b\n"			\
-		"	fence           rw, rw\n"			\
-		"1:\n"							\
-		: [p]"=&r" (_prev), [rc]"=&r" (_rc), [c]"+A" (counter)	\
-		:							\
-		: "memory");						\
-})
 
 static __always_inline bool arch_atomic_dec_unless_positive(atomic_t *v)
 {
-	int prev, rc;
+	int prev;
+	unsigned long flags;
 
-	_arch_atomic_dec_unless_positive(prev, rc, v->counter, "w");
-
-	return !(prev > 0);
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	if (prev <= 0) {
+		v->counter = prev - 1;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
+	return prev <= 0;
 }
-
 #define arch_atomic_dec_unless_positive arch_atomic_dec_unless_positive
-
-#define _arch_atomic_dec_if_positive(_prev, _rc, counter, sfx)		\
-({									\
-	__asm__ __volatile__ (						\
-		"0:	lr." sfx "     %[p],  %[c]\n"			\
-		"	addi           %[rc], %[p], -1\n"		\
-		"	bltz           %[rc], 1f\n"			\
-		"	sc." sfx ".rl  %[rc], %[rc], %[c]\n"		\
-		"	bnez           %[rc], 0b\n"			\
-		"	fence          rw, rw\n"			\
-		"1:\n"							\
-		: [p]"=&r" (_prev), [rc]"=&r" (_rc), [c]"+A" (counter)	\
-		:							\
-		: "memory");						\
-})
 
 static __always_inline int arch_atomic_dec_if_positive(atomic_t *v)
 {
-       int prev, rc;
+	int prev, dec;
+	unsigned long flags;
 
-	_arch_atomic_dec_if_positive(prev, rc, v->counter, "w");
-
-	return prev - 1;
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	dec = prev - 1;
+	if (dec >= 0) {
+		v->counter = dec;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
+	return dec;
 }
-
 #define arch_atomic_dec_if_positive arch_atomic_dec_if_positive
 
 #ifndef CONFIG_GENERIC_ATOMIC64
 static __always_inline bool arch_atomic64_inc_unless_negative(atomic64_t *v)
 {
 	s64 prev;
-	long rc;
+	unsigned long flags;
 
-	_arch_atomic_inc_unless_negative(prev, rc, v->counter, "d");
-
-	return !(prev < 0);
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	if (prev >= 0) {
+		v->counter = prev + 1;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
+	return prev >= 0;
 }
-
 #define arch_atomic64_inc_unless_negative arch_atomic64_inc_unless_negative
 
 static __always_inline bool arch_atomic64_dec_unless_positive(atomic64_t *v)
 {
 	s64 prev;
-	long rc;
+	unsigned long flags;
 
-	_arch_atomic_dec_unless_positive(prev, rc, v->counter, "d");
-
-	return !(prev > 0);
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	if (prev <= 0) {
+		v->counter = prev - 1;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
+	return prev <= 0;
 }
-
 #define arch_atomic64_dec_unless_positive arch_atomic64_dec_unless_positive
 
 static __always_inline s64 arch_atomic64_dec_if_positive(atomic64_t *v)
 {
-       s64 prev;
-       long rc;
+	s64 prev, dec;
+	unsigned long flags;
 
-	_arch_atomic_dec_if_positive(prev, rc, v->counter, "d");
-
-	return prev - 1;
+	raw_local_irq_save(flags);
+	__cmpxchg_fence();
+	prev = v->counter;
+	dec = prev - 1;
+	if (dec >= 0) {
+		v->counter = dec;
+		__cmpxchg_fence();
+	}
+	raw_local_irq_restore(flags);
+	return dec;
 }
-
 #define arch_atomic64_dec_if_positive	arch_atomic64_dec_if_positive
 #endif
 

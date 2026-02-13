@@ -92,6 +92,55 @@
 	REG_L	a0, TASK_TI_A0(tp)
 .endm
 
+/*
+ * Ibex mtvec vector table.
+ *
+ * Ibex hardwires mtvec[7:1]=0 (256-byte alignment) and mtvec[0]=1
+ * (vectored mode).  In vectored mode:
+ *   - synchronous exceptions jump to BASE + 0
+ *   - interrupt cause N jumps to BASE + 4*N
+ *
+ * Each entry is a single 4-byte jump to the common handler.
+ * 32 entries cover all standard causes plus Ibex fast interrupts.
+ */
+.option push
+.option norvc
+.balign 256
+SYM_CODE_START(mtvec_vector_table)
+	j handle_exception	/* 0: synchronous exceptions */
+	j handle_exception	/* 1: supervisor software interrupt */
+	j handle_exception	/* 2: reserved */
+	j handle_exception	/* 3: machine software interrupt */
+	j handle_exception	/* 4: reserved */
+	j handle_exception	/* 5: supervisor timer interrupt */
+	j handle_exception	/* 6: reserved */
+	j handle_exception	/* 7: machine timer interrupt */
+	j handle_exception	/* 8: reserved */
+	j handle_exception	/* 9: supervisor external interrupt */
+	j handle_exception	/* 10: reserved */
+	j handle_exception	/* 11: machine external interrupt */
+	j handle_exception	/* 12 */
+	j handle_exception	/* 13 */
+	j handle_exception	/* 14 */
+	j handle_exception	/* 15 */
+	j handle_exception	/* 16: fast interrupt 0 */
+	j handle_exception	/* 17: fast interrupt 1 */
+	j handle_exception	/* 18: fast interrupt 2 */
+	j handle_exception	/* 19: fast interrupt 3 */
+	j handle_exception	/* 20: fast interrupt 4 */
+	j handle_exception	/* 21: fast interrupt 5 */
+	j handle_exception	/* 22: fast interrupt 6 */
+	j handle_exception	/* 23: fast interrupt 7 */
+	j handle_exception	/* 24: fast interrupt 8 */
+	j handle_exception	/* 25: fast interrupt 9 */
+	j handle_exception	/* 26: fast interrupt 10 */
+	j handle_exception	/* 27: fast interrupt 11 */
+	j handle_exception	/* 28: fast interrupt 12 */
+	j handle_exception	/* 29: fast interrupt 13 */
+	j handle_exception	/* 30: fast interrupt 14 */
+	j handle_exception	/* 31: fast interrupt 15 */
+SYM_CODE_END(mtvec_vector_table)
+.option pop
 
 SYM_CODE_START(handle_exception)
 	/*
@@ -261,7 +310,7 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	 * arbitrarily large.
 	 */
 	REG_L  a2, PT_EPC(sp)
-	REG_SC x0, a2, PT_EPC(sp)
+	REG_S  a2, PT_EPC(sp)
 
 	csrw CSR_STATUS, a0
 	csrw CSR_EPC, a2

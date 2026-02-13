@@ -185,166 +185,101 @@ legacy:
 
 #include <asm-generic/bitops/const_hweight.h>
 
-#if (BITS_PER_LONG == 64)
-#define __AMO(op)	"amo" #op ".d"
-#elif (BITS_PER_LONG == 32)
-#define __AMO(op)	"amo" #op ".w"
-#else
-#error "Unexpected BITS_PER_LONG"
-#endif
-
-#define __test_and_op_bit_ord(op, mod, nr, addr, ord)		\
-({								\
-	unsigned long __res, __mask;				\
-	__mask = BIT_MASK(nr);					\
-	__asm__ __volatile__ (					\
-		__AMO(op) #ord " %0, %2, %1"			\
-		: "=r" (__res), "+A" (addr[BIT_WORD(nr)])	\
-		: "r" (mod(__mask))				\
-		: "memory");					\
-	((__res & __mask) != 0);				\
-})
-
-#define __op_bit_ord(op, mod, nr, addr, ord)			\
-	__asm__ __volatile__ (					\
-		__AMO(op) #ord " zero, %1, %0"			\
-		: "+A" (addr[BIT_WORD(nr)])			\
-		: "r" (mod(BIT_MASK(nr)))			\
-		: "memory");
-
-#define __test_and_op_bit(op, mod, nr, addr) 			\
-	__test_and_op_bit_ord(op, mod, nr, addr, .aqrl)
-#define __op_bit(op, mod, nr, addr)				\
-	__op_bit_ord(op, mod, nr, addr, )
-
-/* Bitmask modifiers */
-#define __NOP(x)	(x)
-#define __NOT(x)	(~(x))
-
-/**
- * arch_test_and_set_bit - Set a bit and return its old value
- * @nr: Bit to set
- * @addr: Address to count from
- *
- * This is an atomic fully-ordered operation (implied full memory barrier).
+/*
+ * IRQ-safe atomic bitops for single-hart cores without the A extension.
+ * Disabling interrupts guarantees atomicity since there is no other hart.
  */
+
 static __always_inline int arch_test_and_set_bit(int nr, volatile unsigned long *addr)
 {
-	return __test_and_op_bit(or, __NOP, nr, addr);
+	unsigned long __flags, __res, __mask = BIT_MASK(nr);
+	volatile unsigned long *__p = &addr[BIT_WORD(nr)];
+
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	__res = *__p;
+	*__p = __res | __mask;
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
+	return (__res & __mask) != 0;
 }
 
-/**
- * arch_test_and_clear_bit - Clear a bit and return its old value
- * @nr: Bit to clear
- * @addr: Address to count from
- *
- * This is an atomic fully-ordered operation (implied full memory barrier).
- */
 static __always_inline int arch_test_and_clear_bit(int nr, volatile unsigned long *addr)
 {
-	return __test_and_op_bit(and, __NOT, nr, addr);
+	unsigned long __flags, __res, __mask = BIT_MASK(nr);
+	volatile unsigned long *__p = &addr[BIT_WORD(nr)];
+
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	__res = *__p;
+	*__p = __res & ~__mask;
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
+	return (__res & __mask) != 0;
 }
 
-/**
- * arch_test_and_change_bit - Change a bit and return its old value
- * @nr: Bit to change
- * @addr: Address to count from
- *
- * This operation is atomic and cannot be reordered.
- * It also implies a memory barrier.
- */
 static __always_inline int arch_test_and_change_bit(int nr, volatile unsigned long *addr)
 {
-	return __test_and_op_bit(xor, __NOP, nr, addr);
+	unsigned long __flags, __res, __mask = BIT_MASK(nr);
+	volatile unsigned long *__p = &addr[BIT_WORD(nr)];
+
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	__res = *__p;
+	*__p = __res ^ __mask;
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
+	return (__res & __mask) != 0;
 }
 
-/**
- * arch_set_bit - Atomically set a bit in memory
- * @nr: the bit to set
- * @addr: the address to start counting from
- *
- * Note: there are no guarantees that this function will not be reordered
- * on non x86 architectures, so if you are writing portable code,
- * make sure not to rely on its reordering guarantees.
- *
- * Note that @nr may be almost arbitrarily large; this function is not
- * restricted to acting on a single-word quantity.
- */
 static __always_inline void arch_set_bit(int nr, volatile unsigned long *addr)
 {
-	__op_bit(or, __NOP, nr, addr);
+	unsigned long __flags;
+	volatile unsigned long *__p = &addr[BIT_WORD(nr)];
+
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	*__p |= BIT_MASK(nr);
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
 }
 
-/**
- * arch_clear_bit - Clears a bit in memory
- * @nr: Bit to clear
- * @addr: Address to start counting from
- *
- * Note: there are no guarantees that this function will not be reordered
- * on non x86 architectures, so if you are writing portable code,
- * make sure not to rely on its reordering guarantees.
- */
 static __always_inline void arch_clear_bit(int nr, volatile unsigned long *addr)
 {
-	__op_bit(and, __NOT, nr, addr);
+	unsigned long __flags;
+	volatile unsigned long *__p = &addr[BIT_WORD(nr)];
+
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	*__p &= ~BIT_MASK(nr);
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
 }
 
-/**
- * arch_change_bit - Toggle a bit in memory
- * @nr: Bit to change
- * @addr: Address to start counting from
- *
- * change_bit()  may be reordered on other architectures than x86.
- * Note that @nr may be almost arbitrarily large; this function is not
- * restricted to acting on a single-word quantity.
- */
 static __always_inline void arch_change_bit(int nr, volatile unsigned long *addr)
 {
-	__op_bit(xor, __NOP, nr, addr);
+	unsigned long __flags;
+	volatile unsigned long *__p = &addr[BIT_WORD(nr)];
+
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	*__p ^= BIT_MASK(nr);
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
 }
 
-/**
- * arch_test_and_set_bit_lock - Set a bit and return its old value, for lock
- * @nr: Bit to set
- * @addr: Address to count from
- *
- * This operation is atomic and provides acquire barrier semantics.
- * It can be used to implement bit locks.
- */
 static __always_inline int arch_test_and_set_bit_lock(
 	unsigned long nr, volatile unsigned long *addr)
 {
-	return __test_and_op_bit_ord(or, __NOP, nr, addr, .aq);
+	return arch_test_and_set_bit(nr, addr);
 }
 
-/**
- * arch_clear_bit_unlock - Clear a bit in memory, for unlock
- * @nr: the bit to set
- * @addr: the address to start counting from
- *
- * This operation is atomic and provides release barrier semantics.
- */
 static __always_inline void arch_clear_bit_unlock(
 	unsigned long nr, volatile unsigned long *addr)
 {
-	__op_bit_ord(and, __NOT, nr, addr, .rl);
+	arch_clear_bit(nr, addr);
 }
 
-/**
- * arch___clear_bit_unlock - Clear a bit in memory, for unlock
- * @nr: the bit to set
- * @addr: the address to start counting from
- *
- * This operation is like clear_bit_unlock, however it is not atomic.
- * It does provide release barrier semantics so it can be used to unlock
- * a bit lock, however it would only be used if no other CPU can modify
- * any bits in the memory until the lock is released (a good example is
- * if the bit lock itself protects access to the other bits in the word).
- *
- * On RISC-V systems there seems to be no benefit to taking advantage of the
- * non-atomic property here: it's a lot more instructions and we still have to
- * provide release semantics anyway.
- */
 static __always_inline void arch___clear_bit_unlock(
 	unsigned long nr, volatile unsigned long *addr)
 {
@@ -354,20 +289,16 @@ static __always_inline void arch___clear_bit_unlock(
 static __always_inline bool arch_xor_unlock_is_negative_byte(unsigned long mask,
 		volatile unsigned long *addr)
 {
-	unsigned long res;
-	__asm__ __volatile__ (
-		__AMO(xor) ".rl %0, %2, %1"
-		: "=r" (res), "+A" (*addr)
-		: "r" (__NOP(mask))
-		: "memory");
-	return (res & BIT(7)) != 0;
-}
+	unsigned long __flags, __res;
 
-#undef __test_and_op_bit
-#undef __op_bit
-#undef __NOP
-#undef __NOT
-#undef __AMO
+	raw_local_irq_save(__flags);
+	__cmpxchg_fence();
+	__res = *addr;
+	*addr = __res ^ mask;
+	__cmpxchg_fence();
+	raw_local_irq_restore(__flags);
+	return (__res & BIT(7)) != 0;
+}
 
 #include <asm-generic/bitops/instrumented-atomic.h>
 #include <asm-generic/bitops/instrumented-lock.h>

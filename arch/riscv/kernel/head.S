@@ -188,7 +188,7 @@ secondary_start_sbi:
 .align 2
 .Lsetup_trap_vector:
 	/* Set trap vector to exception handler */
-	la a0, handle_exception
+	la a0, mtvec_vector_table
 	csrw CSR_TVEC, a0
 
 	/*
@@ -200,7 +200,23 @@ secondary_start_sbi:
 
 SYM_CODE_END(_start)
 
+/*
+ * Minimal early trap handler — just spins.  Used until the real
+ * vector table is installed by .Lsetup_trap_vector.
+ */
+.align 2
+.Learly_trap:
+	j .Learly_trap
+
 SYM_CODE_START(_start_kernel)
+	/*
+	 * Point mtvec into kernel space immediately.  After reset it
+	 * still aims at SRAM; any exception before we fix it would
+	 * jump to stale code there.
+	 */
+	la a0, .Learly_trap
+	csrw CSR_TVEC, a0
+
 	/* Mask all interrupts */
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero
@@ -289,6 +305,41 @@ SYM_CODE_START(_start_kernel)
 #endif
 
 #ifndef CONFIG_XIP_KERNEL
+	/*
+	 * Zero SRAM (0x00100000-0x00120000).
+	 * Used for kernel stacks; must be clean for repeatable behaviour.
+	 */
+	li a3, 0x00100000
+	li a4, 0x00120000
+.Lclear_sram:
+	sw zero, 0(a3)
+	sw zero, 4(a3)
+	sw zero, 8(a3)
+	sw zero, 12(a3)
+	addi a3, a3, 16
+	blt a3, a4, .Lclear_sram
+
+	/*
+	 * Zero free HyperRAM — everything AFTER the kernel image.
+	 * On FPGA, HyperRAM starts with undefined contents.
+	 * The kernel only clears BSS, but free pages used by the
+	 * buddy/slab allocator also need to be clean.
+	 * Clear from _end to 0x40800000 (end of 8MB HyperRAM).
+	 */
+	la a3, _end
+	addi a3, a3, 15
+	andi a3, a3, -16	/* align up to 16 bytes */
+	li a4, 0x40800000	/* end of 8MB HyperRAM */
+	ble a4, a3, .Lclear_hyperram_done
+.Lclear_hyperram:
+	sw zero, 0(a3)
+	sw zero, 4(a3)
+	sw zero, 8(a3)
+	sw zero, 12(a3)
+	addi a3, a3, 16
+	blt a3, a4, .Lclear_hyperram
+.Lclear_hyperram_done:
+
 	/* Clear BSS for flat non-ELF images */
 	la a3, __bss_start
 	la a4, __bss_stop
@@ -305,8 +356,7 @@ SYM_CODE_START(_start_kernel)
 
 	/* Initialize page tables and relocate to virtual addresses */
 	la tp, init_task
-	la sp, init_thread_union + THREAD_SIZE
-	XIP_FIXUP_OFFSET sp
+	li sp, 0x00120000
 	addi sp, sp, -PT_SIZE_ON_STACK
 	scs_load_init_stack
 #ifdef CONFIG_BUILTIN_DTB
@@ -328,7 +378,7 @@ SYM_CODE_START(_start_kernel)
 	call .Lsetup_trap_vector
 	/* Restore C environment */
 	la tp, init_task
-	la sp, init_thread_union + THREAD_SIZE
+	li sp, 0x00120000
 	addi sp, sp, -PT_SIZE_ON_STACK
 	scs_load_current
 

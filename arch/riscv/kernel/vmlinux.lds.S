@@ -12,7 +12,18 @@
 #else
 
 #include <asm/pgtable.h>
+#ifdef CONFIG_MMU
 #define LOAD_OFFSET KERNEL_LINK_ADDR
+#else
+/*
+ * For nommu, VMA == LMA (no address translation).
+ * LOAD_OFFSET is used in AT() directives: AT(VMA - LOAD_OFFSET).
+ * Setting it to 0 ensures LMA = VMA, so the ELF loader places
+ * segments at the correct physical address.
+ * The VMA start is set explicitly below using KERNEL_LINK_ADDR.
+ */
+#define LOAD_OFFSET 0
+#endif
 
 #include <asm/vmlinux.lds.h>
 #include <asm/page.h>
@@ -30,7 +41,7 @@ jiffies = jiffies_64;
 SECTIONS
 {
 	/* Beginning of code and text segment */
-	. = LOAD_OFFSET;
+	. = KERNEL_LINK_ADDR;
 	_start = .;
 	HEAD_TEXT_SECTION
 	. = ALIGN(PAGE_SIZE);

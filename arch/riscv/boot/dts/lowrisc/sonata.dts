@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Device tree for the lowRISC Sonata system.
+ *
+ * CHERIoT Ibex core: RV32IMC, M-mode only, no MMU, single hart.
+ * 128KB SRAM + 8MB HyperRAM.
+ */
+
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "lowrisc,sonata";
+	model = "lowRISC Sonata";
+
+	chosen {
+		bootargs = "earlycon console=ttyOT0";
+		stdout-path = &uart0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <40000000>; /* 40 MHz system clock */
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			compatible = "lowrisc,ibex", "riscv";
+			reg = <0>;
+			riscv,isa = "rv32imc";
+			riscv,isa-base = "rv32i";
+			riscv,isa-extensions = "i", "m", "c", "zicsr", "zifencei";
+			mmu-type = "riscv,none";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	/* Main system memory: 8MB HyperRAM */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x00800000>;
+	};
+
+	soc {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		compatible = "simple-bus";
+		ranges;
+		interrupt-parent = <&plic>;
+
+		/*
+		 * Timer — CLINT-compatible register layout:
+		 *   mtimecmp at +0x4000, mtime at +0xBFF8
+		 * Directly drives the core timer interrupt (mip bit 7).
+		 * IPI (bit 3) declared for driver compatibility but not used
+		 * on this single-hart system.
+		 */
+		clint: timer@80040000 {
+			compatible = "sifive,clint0";
+			reg = <0x80040000 0x10000>;
+			interrupts-extended = <&cpu0_intc 3>,
+					      <&cpu0_intc 7>;
+		};
+
+		plic: interrupt-controller@88000000 {
+			#interrupt-cells = <1>;
+			#address-cells = <0>;
+			compatible = "sifive,plic-1.0.0";
+			reg = <0x88000000 0x04000000>;
+			interrupt-controller;
+			interrupts-extended = <&cpu0_intc 11>;
+			riscv,ndev = <31>;
+		};
+
+		uart0: serial@80100000 {
+			compatible = "lowrisc,opentitan-uart";
+			reg = <0x80100000 0x1000>;
+			interrupts = <8>;
+			clocks = <&sysclk>;
+			status = "okay";
+		};
+
+		uart1: serial@80101000 {
+			compatible = "lowrisc,opentitan-uart";
+			reg = <0x80101000 0x1000>;
+			interrupts = <9>;
+			clocks = <&sysclk>;
+			status = "disabled";
+		};
+
+		spi_ethmac: spi@80301000 {
+			compatible = "lowrisc,opentitan-spi";
+			reg = <0x80301000 0x1000>;
+			interrupts = <25>;
+			clocks = <&sysclk>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			ethernet: ethernet@0 {
+				compatible = "micrel,ks8851";
+				reg = <0>;
+				spi-max-frequency = <25000000>;
+				interrupt-parent = <&plic>;
+				interrupts = <2>;
+			};
+		};
+
+		gpio0: gpio@80000000 {
+			compatible = "lowrisc,sonata-gpio";
+			reg = <0x80000000 0x1000>;
+			status = "okay";
+		};
+	};
+
+	/* Fixed 40 MHz system clock */
+	sysclk: sysclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <40000000>;
+		clock-output-names = "sysclk";
+	};
+};

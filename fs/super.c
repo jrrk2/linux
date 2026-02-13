@@ -775,11 +775,6 @@ retry:
 	s->s_type = fc->fs_type;
 	s->s_iflags |= fc->s_iflags;
 	strscpy(s->s_id, s->s_type->name, sizeof(s->s_id));
-	/*
-	 * Make the superblock visible on @super_blocks and @fs_supers.
-	 * It's in a nascent state and users should wait on SB_BORN or
-	 * SB_DYING to be set.
-	 */
 	list_add_tail(&s->s_list, &super_blocks);
 	hlist_add_head(&s->s_instances, &s->s_type->fs_supers);
 	spin_unlock(&sb_lock);
@@ -1254,10 +1249,6 @@ int get_anon_bdev(dev_t *p)
 {
 	int dev;
 
-	/*
-	 * Many userspace utilities consider an FSID of 0 invalid.
-	 * Always return at least 1 from get_anon_bdev.
-	 */
 	dev = ida_alloc_range(&unnamed_dev_ida, 1, (1 << MINORBITS) - 1,
 			GFP_ATOMIC);
 	if (dev == -ENOSPC)
