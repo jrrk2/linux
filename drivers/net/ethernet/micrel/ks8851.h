@@ -393,11 +393,13 @@ struct ks8851_net {
 	u16			rc_ier;
 	u16			rc_rxqcr;
 	u16			rc_ccr;
+	int			use_poll;
 
 	struct mii_if_info	mii;
 	struct ks8851_rxctrl	rxctrl;
 
 	struct work_struct	rxctrl_work;
+	struct work_struct	irq_work;
 	struct delayed_work	poll_work;
 
 	struct sk_buff_head	txq;

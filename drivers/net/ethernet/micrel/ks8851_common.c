@@ -297,29 +297,143 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 }
 
 /**
- * ks8851_irq - IRQ handler for dealing with interrupt requests
- * @irq: IRQ number
- * @_ks: cookie
+ * ks8851_irq_work - deferred IRQ processing via workqueue
+ * @work: work structure embedded in ks8851_net
  *
- * This handler is invoked when the IRQ line asserts to find out what happened.
- * As we cannot allow ourselves to sleep in HARDIRQ context, this handler runs
- * in thread context.
- *
- * Read the interrupt status, work out what needs to be done and then clear
- * any of the interrupts that are not needed.
+ * Performs the actual SPI-based interrupt handling that cannot run in
+ * hardirq context.  The hardirq primary handler (ks8851_irq_primary)
+ * disables the IRQ at the PLIC level and schedules this work.
+ * After processing, we re-enable the PLIC IRQ.
  */
-static irqreturn_t ks8851_irq(int irq, void *_ks)
+static void ks8851_irq_work(struct work_struct *work)
 {
-	struct ks8851_net *ks = _ks;
+	struct ks8851_net *ks = container_of(work, struct ks8851_net, irq_work);
 	struct sk_buff_head rxq;
 	unsigned long flags;
 	unsigned int status;
 	struct sk_buff *skb;
+	int link_changed = 0;
+	int link_up = 0;
+
+	__skb_queue_head_init(&rxq);
 
 	ks8851_lock(ks, &flags);
 
-	/* Disable chip interrupts to de-assert the IRQ line immediately */
+	/* Disable chip IER to de-assert the interrupt line before
+	 * we read ISR — prevents the PLIC from re-latching pending
+	 * during our SPI transactions. */
 	ks8851_wrreg16(ks, KS_IER, 0x0000);
+
+	status = ks8851_rdreg16(ks, KS_ISR);
+	ks8851_wrreg16(ks, KS_ISR, status);
+
+	if (status & ks->rc_ier) {
+		if (status & IRQ_LCI) {
+			u16 pmecr = ks8851_rdreg16(ks, KS_PMECR);
+			pmecr &= ~PMECR_WKEVT_MASK;
+			ks8851_wrreg16(ks, KS_PMECR, pmecr | PMECR_WKEVT_LINK);
+			/* Read link status directly — cannot call
+			 * mii_check_link here as it would re-acquire
+			 * the SPI mutex and deadlock. */
+			ks8851_rdreg16(ks, KS_P1MBSR); /* dummy read to latch */
+			link_up = !!(ks8851_rdreg16(ks, KS_P1MBSR) & BMSR_LSTATUS);
+			link_changed = 1;
+		}
+
+		if (status & IRQ_TXI) {
+			unsigned short tx_space = ks8851_rdreg16(ks, KS_TXMIR);
+
+			netif_dbg(ks, intr, ks->netdev,
+				  "%s: txspace %d\n", __func__, tx_space);
+
+			spin_lock_bh(&ks->statelock);
+			ks->tx_space = tx_space;
+			if (netif_queue_stopped(ks->netdev))
+				netif_wake_queue(ks->netdev);
+			spin_unlock_bh(&ks->statelock);
+		}
+
+		if (status & IRQ_SPIBEI)
+			netdev_err(ks->netdev, "%s: spi bus error\n", __func__);
+
+		if (status & IRQ_RXI)
+			ks8851_rx_pkts(ks, &rxq);
+
+		if (status & IRQ_RXPSI) {
+			struct ks8851_rxctrl *rxc = &ks->rxctrl;
+
+			ks8851_wrreg16(ks, KS_MAHTR0, rxc->mchash[0]);
+			ks8851_wrreg16(ks, KS_MAHTR1, rxc->mchash[1]);
+			ks8851_wrreg16(ks, KS_MAHTR2, rxc->mchash[2]);
+			ks8851_wrreg16(ks, KS_MAHTR3, rxc->mchash[3]);
+
+			ks8851_wrreg16(ks, KS_RXCR2, rxc->rxcr2);
+			ks8851_wrreg16(ks, KS_RXCR1, rxc->rxcr1);
+		}
+	}
+
+	ks8851_unlock(ks, &flags);
+
+	if (link_changed) {
+		if (link_up && !netif_carrier_ok(ks->netdev)) {
+			netdev_info(ks->netdev, "link up\n");
+			netif_carrier_on(ks->netdev);
+		} else if (!link_up && netif_carrier_ok(ks->netdev)) {
+			netdev_info(ks->netdev, "link down\n");
+			netif_carrier_off(ks->netdev);
+		}
+	}
+
+	while ((skb = __skb_dequeue(&rxq)))
+		netif_rx(skb);
+
+	/* Re-enable PLIC with source de-asserted (IER still 0).
+	 * A stale pending from the previous cycle's EOI may fire here,
+	 * but the EOI will see source de-asserted → no new stale. */
+	enable_irq(ks->netdev->irq);
+
+	/* Now re-enable chip IER.  If new events arrived, the source
+	 * asserts and the PLIC fires normally.  If the stale pending
+	 * above already disabled the PLIC, the re-scheduled work
+	 * will process the events. */
+	ks8851_lock(ks, &flags);
+	ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+	ks8851_unlock(ks, &flags);
+}
+
+/**
+ * ks8851_irq_primary - hardirq handler for KSZ8851 interrupts
+ * @irq: IRQ number
+ * @_ks: cookie
+ *
+ * Runs in hardirq context.  Immediately disables the IRQ at the PLIC
+ * (fast MMIO write) and schedules the SPI work.  Returns IRQ_HANDLED
+ * to prevent spurious IRQ detection.
+ */
+static irqreturn_t ks8851_irq_primary(int irq, void *_ks)
+{
+	struct ks8851_net *ks = _ks;
+
+	disable_irq_nosync(irq);
+	schedule_work(&ks->irq_work);
+	return IRQ_HANDLED;
+}
+
+/**
+ * ks8851_irq - process KSZ8851 interrupt events (called from poll_work)
+ */
+static void ks8851_irq(struct ks8851_net *ks)
+{
+	struct sk_buff_head rxq;
+	unsigned long flags;
+	unsigned int status;
+	struct sk_buff *skb;
+	int link_changed = 0;
+	int link_up = 0;
+
+	__skb_queue_head_init(&rxq);
+
+	ks8851_lock(ks, &flags);
 
 	status = ks8851_rdreg16(ks, KS_ISR);
 	ks8851_wrreg16(ks, KS_ISR, status);
@@ -327,65 +441,59 @@ static irqreturn_t ks8851_irq(int irq, void *_ks)
 	netif_dbg(ks, intr, ks->netdev,
 		  "%s: status 0x%04x\n", __func__, status);
 
-	if (status & IRQ_LDI) {
-		u16 pmecr = ks8851_rdreg16(ks, KS_PMECR);
-		pmecr &= ~PMECR_WKEVT_MASK;
-		ks8851_wrreg16(ks, KS_PMECR, pmecr | PMECR_WKEVT_LINK);
+	if (status & ks->rc_ier) {
+		if (status & IRQ_LCI) {
+			u16 pmecr = ks8851_rdreg16(ks, KS_PMECR);
+			pmecr &= ~PMECR_WKEVT_MASK;
+			ks8851_wrreg16(ks, KS_PMECR, pmecr | PMECR_WKEVT_LINK);
+			ks8851_rdreg16(ks, KS_P1MBSR); /* dummy read to latch */
+			link_up = !!(ks8851_rdreg16(ks, KS_P1MBSR) & BMSR_LSTATUS);
+			link_changed = 1;
+		}
+
+		if (status & IRQ_TXI) {
+			unsigned short tx_space = ks8851_rdreg16(ks, KS_TXMIR);
+
+			netif_dbg(ks, intr, ks->netdev,
+				  "%s: txspace %d\n", __func__, tx_space);
+
+			spin_lock_bh(&ks->statelock);
+			ks->tx_space = tx_space;
+			if (netif_queue_stopped(ks->netdev))
+				netif_wake_queue(ks->netdev);
+			spin_unlock_bh(&ks->statelock);
+		}
+
+		if (status & IRQ_SPIBEI)
+			netdev_err(ks->netdev, "%s: spi bus error\n", __func__);
+
+		if (status & IRQ_RXI)
+			ks8851_rx_pkts(ks, &rxq);
+
+		if (status & IRQ_RXPSI) {
+			struct ks8851_rxctrl *rxc = &ks->rxctrl;
+
+			ks8851_wrreg16(ks, KS_MAHTR0, rxc->mchash[0]);
+			ks8851_wrreg16(ks, KS_MAHTR1, rxc->mchash[1]);
+			ks8851_wrreg16(ks, KS_MAHTR2, rxc->mchash[2]);
+			ks8851_wrreg16(ks, KS_MAHTR3, rxc->mchash[3]);
+
+			ks8851_wrreg16(ks, KS_RXCR2, rxc->rxcr2);
+			ks8851_wrreg16(ks, KS_RXCR1, rxc->rxcr1);
+		}
 	}
-
-	if (status & IRQ_TXI) {
-		unsigned short tx_space = ks8851_rdreg16(ks, KS_TXMIR);
-
-		netif_dbg(ks, intr, ks->netdev,
-			  "%s: txspace %d\n", __func__, tx_space);
-
-		spin_lock_bh(&ks->statelock);
-		ks->tx_space = tx_space;
-		if (netif_queue_stopped(ks->netdev))
-			netif_wake_queue(ks->netdev);
-		spin_unlock_bh(&ks->statelock);
-	}
-
-	if (status & IRQ_SPIBEI) {
-		netdev_err(ks->netdev, "%s: spi bus error\n", __func__);
-	}
-
-	if (status & IRQ_RXI) {
-		/* the datasheet says to disable the rx interrupt during
-		 * packet read-out, however we're masking the interrupt
-		 * from the device so do not bother masking just the RX
-		 * from the device. */
-
-		__skb_queue_head_init(&rxq);
-		ks8851_rx_pkts(ks, &rxq);
-	}
-
-	/* if something stopped the rx process, probably due to wanting
-	 * to change the rx settings, then do something about restarting
-	 * it. */
-	if (status & IRQ_RXPSI) {
-		struct ks8851_rxctrl *rxc = &ks->rxctrl;
-
-		/* update the multicast hash table */
-		ks8851_wrreg16(ks, KS_MAHTR0, rxc->mchash[0]);
-		ks8851_wrreg16(ks, KS_MAHTR1, rxc->mchash[1]);
-		ks8851_wrreg16(ks, KS_MAHTR2, rxc->mchash[2]);
-		ks8851_wrreg16(ks, KS_MAHTR3, rxc->mchash[3]);
-
-		ks8851_wrreg16(ks, KS_RXCR2, rxc->rxcr2);
-		ks8851_wrreg16(ks, KS_RXCR1, rxc->rxcr1);
-	}
-
-	/* Re-enable chip interrupts now that we've serviced everything */
-	ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
 
 	ks8851_unlock(ks, &flags);
 
-	if (status & IRQ_RXI)
-		while ((skb = __skb_dequeue(&rxq)))
-			netif_rx(skb);
+	if (link_changed) {
+		if (link_up && !netif_carrier_ok(ks->netdev))
+			netif_carrier_on(ks->netdev);
+		else if (!link_up && netif_carrier_ok(ks->netdev))
+			netif_carrier_off(ks->netdev);
+	}
 
-	return IRQ_HANDLED;
+	while ((skb = __skb_dequeue(&rxq)))
+		netif_rx(skb);
 }
 
 /**
@@ -402,10 +510,10 @@ static void ks8851_poll_work(struct work_struct *work)
 	struct ks8851_net *ks = container_of(work, struct ks8851_net,
 					     poll_work.work);
 
-	ks8851_irq(0, ks);
+	ks8851_irq(ks);
 
 	if (netif_running(ks->netdev))
-		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(20));
+		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(5));
 }
 
 /**
@@ -429,12 +537,10 @@ static int ks8851_net_open(struct net_device *dev)
 {
 	struct ks8851_net *ks = netdev_priv(dev);
 	unsigned long flags;
+	int ret;
 
-	/* Polled mode: bypass the PLIC entirely.  Keep IER=0 so the chip
-	 * never asserts its IRQ pin.  ISR bits are still set by hardware
-	 * and will be read by the poll worker. */
-	ks->rc_ier = 0;
 	INIT_DELAYED_WORK(&ks->poll_work, ks8851_poll_work);
+	INIT_WORK(&ks->irq_work, ks8851_irq_work);
 
 	/* lock the card, even if we may not actually be doing anything
 	 * else at the moment */
@@ -481,9 +587,13 @@ static int ks8851_net_open(struct net_device *dev)
 
 	ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
 
-	/* clear all pending interrupts; keep IER=0 for polled mode */
+	/* clear all pending interrupts */
 	ks8851_wrreg16(ks, KS_ISR, 0xFFFF);
-	ks8851_wrreg16(ks, KS_IER, 0x0000);
+
+	/* Always set rc_ier to the events we care about — the IRQ handler
+	 * uses it as a mask when reading ISR.  In polled mode we just
+	 * don't write it to the chip's IER so no actual interrupts fire. */
+	ks->rc_ier = IRQ_LCI | IRQ_TXI | IRQ_RXI;
 
 	ks->queued_len = 0;
 	ks->tx_space = ks8851_rdreg16(ks, KS_TXMIR);
@@ -492,11 +602,37 @@ static int ks8851_net_open(struct net_device *dev)
 	netif_dbg(ks, ifup, ks->netdev, "network device up\n");
 
 	ks8851_unlock(ks, &flags);
-	netif_carrier_on(ks->netdev);
 
-	/* Start polling at 50Hz */
-	schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(20));
-	netdev_info(dev, "using polled mode (20ms interval)\n");
+	/*
+	 * Use a hardirq primary handler that immediately masks the
+	 * IRQ at the PLIC and schedules work.  This avoids the
+	 * level-triggered PLIC + ONESHOT stale-pending race that
+	 * causes "nobody cared" with threaded handlers.
+	 */
+	ret = request_irq(dev->irq, ks8851_irq_primary,
+			  IRQF_NO_AUTOEN, dev->name, ks);
+	if (ret < 0) {
+		netdev_err(dev, "failed to get irq, falling back to polled mode\n");
+		ks->use_poll = 1;
+	}
+
+	if (!ks->use_poll) {
+		/* Clear ISR, enable chip IER, then enable PLIC. */
+		ks8851_lock(ks, &flags);
+		ks8851_wrreg16(ks, KS_ISR, 0xFFFF);
+		ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+		ks8851_unlock(ks, &flags);
+		enable_irq(dev->irq);
+	}
+
+	if (ks->use_poll) {
+		netif_carrier_on(ks->netdev);
+		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(5));
+		netdev_info(dev, "using polled mode (5ms interval)\n");
+	} else {
+		mii_check_link(&ks->mii);
+		netdev_info(dev, "using interrupt mode (IRQ %d)\n", dev->irq);
+	}
 
 	return 0;
 }
@@ -549,7 +685,12 @@ static int ks8851_net_stop(struct net_device *dev)
 		dev_kfree_skb(txb);
 	}
 
-	cancel_delayed_work_sync(&ks->poll_work);
+	if (ks->use_poll) {
+		cancel_delayed_work_sync(&ks->poll_work);
+	} else {
+		cancel_work_sync(&ks->irq_work);
+		free_irq(dev->irq, ks);
+	}
 
 	return 0;
 }
