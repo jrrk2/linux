@@ -614,6 +614,11 @@ restart:
 		h += softirq_bit - 1;
 
 		vec_nr = h - softirq_vec;
+		if (unlikely(vec_nr >= NR_SOFTIRQS)) {
+			pr_err("softirq: out of bounds vec_nr=%u pending=0x%08x softirq_bit=%d\n",
+			       vec_nr, local_softirq_pending(), softirq_bit);
+			break;
+		}
 		prev_count = preempt_count();
 
 		kstat_incr_softirqs_this_cpu(vec_nr);

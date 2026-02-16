@@ -337,6 +337,26 @@ void __init setup_arch(char **cmdline_p)
 				sum, (unsigned int)(_etext - _stext));
 	}
 
+	/*
+	 * Sonata pinmux: route SPI0 signals to microSD card pins.
+	 *   0x80005052 ← 1  microsd_cmd  → spi_0_copi
+	 *   0x80005053 ← 1  microsd_clk  → spi_0_sclk
+	 *   0x80005054 ← 1  microsd_dat3 → spi_0_cs[1]
+	 *   0x80005843 ← 2  spi_0_cipo   ← microsd_dat0
+	 */
+	{
+		void __iomem *pinmux = ioremap(0x80005000, 0x1000);
+
+		if (pinmux) {
+			writeb(1, pinmux + 0x052);
+			writeb(1, pinmux + 0x053);
+			writeb(1, pinmux + 0x054);
+			writeb(2, pinmux + 0x843);
+			iounmap(pinmux);
+			pr_info("Sonata pinmux: microSD routed to SPI0\n");
+		}
+	}
+
 	parse_dtb();
 	setup_initial_init_mm(_stext, _etext, _edata, _end);
 
@@ -376,6 +396,66 @@ void __init setup_arch(char **cmdline_p)
 	riscv_init_cbo_blocksizes();
 	riscv_fill_hwcap();
 	apply_boot_alternatives();
+
+	/*
+	 * Protect kernel text with PMP: TOR entries 1-2, locked R+X.
+	 * Entry 7 = RWX NAPOT catch-all (not locked, but M-mode doesn't
+	 * need it — unmatched addresses are allowed in M-mode).
+	 * Must be after apply_boot_alternatives() which patches .text.
+	 *
+	 * PMP entry 0 may be locked by the bootloader — skip it.
+	 * Entry 1: pmpaddr = _start >> 2 (TOR bottom, cfg=0)
+	 * Entry 2: pmpaddr = PAGE_ALIGN(_etext) >> 2, cfg = L|R|X|TOR
+	 */
+#ifdef CONFIG_RISCV_M_MODE
+	{
+		unsigned long etext_aligned = (unsigned long)_etext;
+		etext_aligned = (etext_aligned + PAGE_SIZE - 1) & PAGE_MASK;
+
+		/* Entry 7: RWX catch-all */
+		csr_write(0x3b7, -1UL);  /* pmpaddr7 */
+		csr_write(0x3a1, 0x1fUL << 24);  /* pmpcfg1 byte3 = RWX|NAPOT */
+
+		/* Entry 1: TOR bottom */
+		csr_write(0x3b1, (unsigned long)_stext >> 2);  /* pmpaddr1 */
+
+		/* Entry 2: TOR top, locked R+X */
+		csr_write(0x3b2, etext_aligned >> 2);  /* pmpaddr2 */
+
+		/* Set pmpcfg0 byte 2 = L|R|X|TOR = 0x8D, preserve other bytes */
+		unsigned long cfg = csr_read(0x3a0);  /* pmpcfg0 */
+		cfg &= ~(0xffUL << 16);
+		cfg |= (0x8dUL << 16);  /* L|R|X|TOR */
+		csr_write(0x3a0, cfg);
+
+		pr_info("PMP: text protected [%px - %px] (locked R+X TOR)\n",
+			_stext, (void *)etext_aligned);
+
+		/*
+		 * ePMP (Smepmp): enable Rule Locking Bypass so we can
+		 * update the locked stack guard entry on context switch.
+		 */
+		csr_write(CSR_MSECCFG, MSECCFG_RLB);
+
+		/*
+		 * PMP entry 3: locked NAPOT no-access guard at bottom
+		 * of current (idle) task stack.  128 bytes.
+		 */
+		{
+			unsigned long guard = (unsigned long)current->stack;
+			csr_write(CSR_PMPADDR0 + 3,
+				  (guard >> 2) | PMP_GUARD_NAPOT_MASK);
+			cfg = csr_read(CSR_PMPCFG0);
+			cfg &= ~(0xffUL << 24);
+			cfg |= ((unsigned long)PMP_GUARD_CFG << 24);
+			csr_write(CSR_PMPCFG0, cfg);
+			pr_info("PMP: stack guard [%px - %px] (ePMP RLB)\n",
+				(void *)guard,
+				(void *)(guard + PMP_GUARD_SIZE));
+		}
+	}
+#endif
+
 	init_rt_signal_env();
 
 	if (IS_ENABLED(CONFIG_RISCV_ISA_ZICBOM) &&

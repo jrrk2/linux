@@ -1141,3 +1141,13 @@ config MMC_LITEX
 	  module will be called litex_mmc.
 
 	  If unsure, say N.
+
+config MMC_LOWRISC_SD
+	tristate "LowRISC SD Host Controller support"
+	depends on OF
+	help
+	  This selects support for the LowRISC SD Host Controller found in
+	  the Sonata SoC and lowRISC chip designs. It uses a native SD
+	  protocol interface (not SPI mode).
+
+	  If unsure, say N.

@@ -2276,6 +2276,13 @@ ip_route_input_slow(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 	struct flowi4	fl4;
 	bool do_cache = true;
 
+	/* Sanity check: devconf_all must be valid */
+	if (!net->ipv4.devconf_all) {
+		pr_err_once("ip_route_input_slow: net->ipv4.devconf_all is NULL! net=%px in_dev=%px\n",
+			    net, in_dev);
+		goto out;
+	}
+
 	/* IP on this device is disabled. */
 
 	if (!in_dev)

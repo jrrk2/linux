@@ -1685,6 +1685,15 @@ config FB_VIRTUAL
 
 	  If unsure, say N.
 
+config FB_SONATA_LCD
+	tristate "lowRISC Sonata ST7735 LCD"
+	depends on FB
+	select FB_SYSMEM_HELPERS
+	help
+	  Framebuffer driver for the ST7735 128x160 LCD display on the
+	  lowRISC Sonata board. The display is directly connected to an
+	  OpenTitan SPI controller with D/C and reset on CS pins.
+
 config XEN_FBDEV_FRONTEND
 	tristate "Xen virtual frame buffer support"
 	depends on FB && XEN

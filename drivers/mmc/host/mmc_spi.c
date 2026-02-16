@@ -373,10 +373,9 @@ checkstatus:
 		goto done;
 	}
 
-	if (value < 0)
-		dev_dbg(&host->spi->dev,
-			"  ... CMD%d response SPI_%s: resp %04x %08x\n",
-			cmd->opcode, maptype(cmd), cmd->resp[0], cmd->resp[1]);
+	dev_info(&host->spi->dev,
+		"  CMD%d resp: %04x %08x (value=%d)\n",
+		cmd->opcode, cmd->resp[0], cmd->resp[1], value);
 
 	/* disable chipselect on errors and some success cases */
 	if (value >= 0 && cs_on)

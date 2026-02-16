@@ -123,6 +123,16 @@
 #define PMP_A_NAPOT		0x18
 #define PMP_L			0x80
 
+/* ePMP / Smepmp mseccfg bits */
+#define MSECCFG_MML		0x01
+#define MSECCFG_MMWP		0x02
+#define MSECCFG_RLB		0x04
+
+/* PMP stack guard: 128-byte locked NAPOT no-access at stack bottom */
+#define PMP_GUARD_CFG		(PMP_L | PMP_A_NAPOT)	/* 0x98: no R/W/X */
+#define PMP_GUARD_SIZE		128
+#define PMP_GUARD_NAPOT_MASK	0xF	/* 4 trailing 1s = 2^7 = 128 bytes */
+
 /* HSTATUS flags */
 #ifdef CONFIG_64BIT
 #define HSTATUS_HUPMM		_AC(0x3000000000000, UL)

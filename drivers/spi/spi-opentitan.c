@@ -26,6 +26,7 @@
 
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/gpio/driver.h>
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
@@ -58,6 +59,10 @@
 struct ot_spi {
 	void __iomem *base;
 	struct clk *clk;
+	u32 cs_state;		/* Shadow of CS register (active-low) */
+#ifdef CONFIG_GPIOLIB
+	struct gpio_chip gc;
+#endif
 };
 
 static inline u32 ot_spi_read(struct ot_spi *spi, unsigned int off)
@@ -91,19 +96,17 @@ static int ot_spi_rx_avail(struct ot_spi *spi)
 static void ot_spi_set_cs(struct spi_device *device, bool is_high)
 {
 	struct ot_spi *spi = spi_controller_get_devdata(device->controller);
-	u32 cs_val;
-	int cs_num = 0; /* Sonata: CS[0] is always the data line */
+	int cs_num = spi_get_chipselect(device, 0);
 
 	if (device->mode & SPI_CS_HIGH)
 		is_high = !is_high;
 
-	cs_val = ot_spi_read(spi, OT_SPI_CS);
 	if (is_high)
-		cs_val |= BIT(cs_num);   /* Deassert (CS inactive high) */
+		spi->cs_state |= BIT(cs_num);   /* Deassert (CS inactive high) */
 	else
-		cs_val &= ~BIT(cs_num);  /* Assert (CS active low) */
+		spi->cs_state &= ~BIT(cs_num);  /* Assert (CS active low) */
 
-	ot_spi_write(spi, OT_SPI_CS, cs_val);
+	ot_spi_write(spi, OT_SPI_CS, spi->cs_state);
 }
 
 /*
@@ -259,10 +262,44 @@ done:
 	return ret;
 }
 
+static size_t ot_spi_max_message_size(struct spi_device *spi)
+{
+	return 2047; /* START register is 11 bits */
+}
+
+#ifdef CONFIG_GPIOLIB
+static int ot_spi_gpio_set(struct gpio_chip *gc, unsigned int offset, int val)
+{
+	struct ot_spi *spi = gpiochip_get_data(gc);
+
+	if (val)
+		spi->cs_state |= BIT(offset);
+	else
+		spi->cs_state &= ~BIT(offset);
+	ot_spi_write(spi, OT_SPI_CS, spi->cs_state);
+	return 0;
+}
+
+static int ot_spi_gpio_get(struct gpio_chip *gc, unsigned int offset)
+{
+	struct ot_spi *spi = gpiochip_get_data(gc);
+
+	return !!(spi->cs_state & BIT(offset));
+}
+
+static int ot_spi_gpio_direction_output(struct gpio_chip *gc,
+					unsigned int offset, int val)
+{
+	ot_spi_gpio_set(gc, offset, val);
+	return 0;
+}
+#endif
+
 static int ot_spi_probe(struct platform_device *pdev)
 {
 	struct spi_controller *host;
 	struct ot_spi *spi;
+	u32 reset_cs, reset_ms;
 	int ret;
 
 	host = devm_spi_alloc_host(&pdev->dev, sizeof(*spi));
@@ -282,24 +319,55 @@ static int ot_spi_probe(struct platform_device *pdev)
 	host->dev.of_node = pdev->dev.of_node;
 	host->bus_num = -1;
 	host->num_chipselect = 4;
-	host->mode_bits = SPI_CPOL | SPI_CPHA;
+	host->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH;
 	host->bits_per_word_mask = SPI_BPW_MASK(8);
 	host->transfer_one_message = ot_spi_transfer_one_message;
 	host->set_cs = ot_spi_set_cs;
 	host->max_speed_hz = 25000000;
+	host->max_message_size = ot_spi_max_message_size;
 
 	/* Flush FIFOs — controller won't report IDLE without this */
 	ot_spi_write(spi, OT_SPI_CONTROL,
 		     OT_SPI_CTRL_TX_FLUSH | OT_SPI_CTRL_RX_FLUSH);
 
 	/* Deassert all CS lines (active low) */
-	ot_spi_write(spi, OT_SPI_CS, 0xF);
+	spi->cs_state = 0xF;
+	ot_spi_write(spi, OT_SPI_CS, spi->cs_state);
 
-	/* Reset KSZ8851 via CS[1] (wired to reset pin on Sonata) */
-	ot_spi_write(spi, OT_SPI_CS, 0xF & ~BIT(1));
-	mdelay(150);
-	ot_spi_write(spi, OT_SPI_CS, 0xF);
-	mdelay(100);
+	/* Optional DT-driven reset: pulse a CS line low for a device reset */
+	if (!of_property_read_u32(pdev->dev.of_node, "reset-cs", &reset_cs)) {
+		if (of_property_read_u32(pdev->dev.of_node,
+					 "reset-duration-ms", &reset_ms))
+			reset_ms = 150;
+		dev_info(&pdev->dev, "reset via CS[%u] for %u ms\n",
+			 reset_cs, reset_ms);
+		spi->cs_state &= ~BIT(reset_cs);
+		ot_spi_write(spi, OT_SPI_CS, spi->cs_state);
+		mdelay(reset_ms);
+		spi->cs_state |= BIT(reset_cs);
+		ot_spi_write(spi, OT_SPI_CS, spi->cs_state);
+		mdelay(100);
+	}
+
+#ifdef CONFIG_GPIOLIB
+	if (of_property_read_bool(pdev->dev.of_node, "gpio-controller")) {
+		spi->gc.label = dev_name(&pdev->dev);
+		spi->gc.parent = &pdev->dev;
+		spi->gc.owner = THIS_MODULE;
+		spi->gc.base = -1;
+		spi->gc.ngpio = host->num_chipselect;
+		spi->gc.set = ot_spi_gpio_set;
+		spi->gc.get = ot_spi_gpio_get;
+		spi->gc.direction_output = ot_spi_gpio_direction_output;
+		spi->gc.fwnode = dev_fwnode(&pdev->dev);
+
+		ret = devm_gpiochip_add_data(&pdev->dev, &spi->gc, spi);
+		if (ret) {
+			dev_err(&pdev->dev, "failed to add GPIO chip\n");
+			return ret;
+		}
+	}
+#endif
 
 	ret = devm_spi_register_controller(&pdev->dev, host);
 	if (ret)

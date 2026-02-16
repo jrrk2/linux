@@ -232,14 +232,36 @@ SYM_CODE_START(_start_kernel)
 	 * Setup a PMP to permit access to all of memory.  Some machines may
 	 * not implement PMPs, so we set up a quick trap handler to just skip
 	 * touching the PMPs on any trap.
+	 *
+	 * First clear any stale locked PMP entries from a previous boot
+	 * (e.g. GDB reload without full CPU reset).  Enable ePMP RLB so
+	 * locked entries can be modified, then zero all PMP config.
 	 */
+	/*
+	 * Enable ePMP RLB so we can clear locked PMP entries from a
+	 * previous boot (GDB reload without full CPU reset), then
+	 * set entry 0 = full-RWX NAPOT catch-all.
+	 * Each phase has its own trap target so a failure in one
+	 * doesn't skip subsequent phases.
+	 */
+	la a0, .Lepmp_done
+	csrw CSR_TVEC, a0
+	li a0, 4		/* MSECCFG_RLB */
+	csrw CSR_MSECCFG, a0
+.align 2
+.Lepmp_done:
+
 	la a0, .Lpmp_done
 	csrw CSR_TVEC, a0
-
-	li a0, -1
-	csrw CSR_PMPADDR0, a0
+	/* Clear pmpcfg1 (entries 4-7) — no locked entries here */
+	csrw CSR_PMPCFG0 + 1, zero
+	/* Clear pmpcfg0 entirely (RLB lets us modify locked bytes) and
+	 * set entry 0 = full-RWX NAPOT in one write.
+	 */
 	li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
 	csrw CSR_PMPCFG0, a0
+	li a0, -1
+	csrw CSR_PMPADDR0, a0
 .align 2
 .Lpmp_done:
 

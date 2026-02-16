@@ -364,12 +364,15 @@ static void thread_stack_delayed_free(struct task_struct *tsk)
  * SRAM: 0x00100000–0x00120000 (128KB).
  * Bottom of SRAM holds printk ring buffer (.sram.data section),
  * ending at __sram_end (aligned to THREAD_SIZE by the linker script).
- * Top 8KB (0x0011e000–0x00120000) reserved for idle task (init_task).
+ * Top THREAD_SIZE (0x0011f000–0x00120000) reserved for idle task (init_task).
  */
 extern char __sram_end[];
 #define SRAM_STACK_BASE	((unsigned long)__sram_end)
-#define SRAM_STACK_END	0x0011e000UL
+#define SRAM_STACK_END	(0x00120000UL - THREAD_SIZE)
 static unsigned long sram_stack_next;
+
+/* Free-list for recycling SRAM stacks: first word of freed stack = next ptr */
+static void *sram_stack_freelist;
 
 static inline bool is_sram_stack(void *stack)
 {
@@ -383,7 +386,15 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 	if (!sram_stack_next)
 		sram_stack_next = SRAM_STACK_BASE;
 
-	/* Try SRAM first */
+	/* Try recycled SRAM stack first */
+	if (sram_stack_freelist) {
+		tsk->stack = sram_stack_freelist;
+		sram_stack_freelist = *(void **)sram_stack_freelist;
+		memset(tsk->stack, 0, THREAD_SIZE);
+		return 0;
+	}
+
+	/* Try bump allocator */
 	if (sram_stack_next + THREAD_SIZE <= SRAM_STACK_END) {
 		tsk->stack = (void *)sram_stack_next;
 		sram_stack_next += THREAD_SIZE;
@@ -397,6 +408,8 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 						     THREAD_SIZE_ORDER);
 		if (likely(page)) {
 			tsk->stack = kasan_reset_tag(page_address(page));
+			pr_warn("SRAM stacks full: task %s (pid %d) stack at %px (HyperRAM)\n",
+				tsk->comm, tsk->pid, tsk->stack);
 			return 0;
 		}
 	}
@@ -405,8 +418,10 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 
 static void free_thread_stack(struct task_struct *tsk)
 {
-	/* SRAM stacks are never freed — just leak them */
 	if (is_sram_stack(tsk->stack)) {
+		/* Push onto free-list for reuse */
+		*(void **)tsk->stack = sram_stack_freelist;
+		sram_stack_freelist = tsk->stack;
 		tsk->stack = NULL;
 		return;
 	}

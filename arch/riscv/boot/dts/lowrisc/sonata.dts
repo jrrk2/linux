@@ -101,6 +101,8 @@
 			clocks = <&sysclk>;
 			#address-cells = <1>;
 			#size-cells = <0>;
+			reset-cs = <1>;
+			reset-duration-ms = <150>;
 			status = "okay";
 
 			ethernet: ethernet@0 {
@@ -110,13 +112,28 @@
 				interrupt-parent = <&plic>;
 				interrupts = <2>;
 			};
+		};
 
-			/* CS[1] is wired to KSZ8851 reset — keep as dummy */
-			ethmac_rst: reset@1 {
-				compatible = "lowrisc,sonata-eth-reset";
-				reg = <1>;
-				status = "disabled";
-			};
+		lcd: lcd@80300000 {
+			compatible = "lowrisc,sonata-lcd";
+			reg = <0x80300000 0x1000>;
+			status = "okay";
+		};
+
+		spi0: spi@80302000 {
+			compatible = "lowrisc,opentitan-spi";
+			reg = <0x80302000 0x1000>;
+			clocks = <&sysclk>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+		};
+
+		sd0: sd@80500000 {
+			compatible = "lowrisc,sd-host";
+			reg = <0x80500000 0x1000>;
+			interrupts = <5>;
+			clocks = <&sysclk>;
 		};
 
 		gpio0: gpio@80000000 {

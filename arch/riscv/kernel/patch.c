@@ -15,6 +15,7 @@
 #include <asm/ftrace.h>
 #include <asm/text-patching.h>
 #include <asm/sections.h>
+#include <asm/csr.h>
 
 struct patch_insn {
 	void *addr;
@@ -177,10 +178,52 @@ static int __patch_insn_write(void *addr, const void *insn, size_t len)
 NOKPROBE_SYMBOL(__patch_insn_write);
 #endif /* CONFIG_MMU */
 
+/*
+ * Temporarily bypass PMP text protection for legitimate text patching.
+ *
+ * PMP entry 2 is locked R+X TOR protecting kernel text.
+ * Entry 1 (not locked) normally has cfg=0 (OFF) and holds the TOR
+ * bottom address.  To bypass: set entry 1 to RWX NAPOT covering all
+ * memory (pmpaddr=-1).  Since entry 1 is lower-numbered than entry 2,
+ * it matches first and grants write access.  After patching, restore
+ * entry 1 to OFF with the original pmpaddr.
+ */
+#ifdef CONFIG_RISCV_M_MODE
+#define CSR_PMPADDR1	0x3b1
+#define CSR_PMPCFG0_NUM	0x3a0
+#define PMP_ENTRY1_RWX_NAPOT	0x1f	/* R|W|X|NAPOT */
+
+static void pmp_text_unlock(unsigned long *saved_addr, unsigned long *saved_cfg)
+{
+	*saved_addr = csr_read(CSR_PMPADDR1);
+	*saved_cfg = csr_read(CSR_PMPCFG0_NUM);
+	/* Set pmpaddr1 = all-ones (NAPOT full range) */
+	csr_write(CSR_PMPADDR1, -1UL);
+	/* Enable entry 1: set byte 1 of pmpcfg0 to RWX|NAPOT */
+	csr_write(CSR_PMPCFG0_NUM, (*saved_cfg & ~(0xffUL << 8)) |
+				((unsigned long)PMP_ENTRY1_RWX_NAPOT << 8));
+}
+
+static void pmp_text_lock(unsigned long saved_addr, unsigned long saved_cfg)
+{
+	/* Disable entry 1: restore original cfg (byte 1 = 0) */
+	csr_write(CSR_PMPCFG0_NUM, saved_cfg);
+	/* Restore original pmpaddr1 (TOR bottom) */
+	csr_write(CSR_PMPADDR1, saved_addr);
+	/* Fence to ensure PMP takes effect before next instruction fetch */
+	__asm__ volatile("fence.i");
+}
+#endif
+
 static int patch_insn_set(void *addr, u8 c, size_t len)
 {
 	size_t size;
 	int ret;
+#ifdef CONFIG_RISCV_M_MODE
+	unsigned long saved_addr, saved_cfg;
+
+	pmp_text_unlock(&saved_addr, &saved_cfg);
+#endif
 
 	/*
 	 * __patch_insn_set() can only work on 2 pages at a time so call it in a
@@ -190,13 +233,17 @@ static int patch_insn_set(void *addr, u8 c, size_t len)
 		size = min(len, PAGE_SIZE * 2 - offset_in_page(addr));
 		ret = __patch_insn_set(addr, c, size);
 		if (ret)
-			return ret;
+			break;
 
 		addr += size;
 		len -= size;
 	}
 
-	return 0;
+#ifdef CONFIG_RISCV_M_MODE
+	pmp_text_lock(saved_addr, saved_cfg);
+#endif
+
+	return len ? ret : 0;
 }
 NOKPROBE_SYMBOL(patch_insn_set);
 
@@ -216,6 +263,11 @@ int patch_insn_write(void *addr, const void *insn, size_t len)
 {
 	size_t size;
 	int ret;
+#ifdef CONFIG_RISCV_M_MODE
+	unsigned long saved_addr, saved_cfg;
+
+	pmp_text_unlock(&saved_addr, &saved_cfg);
+#endif
 
 	/*
 	 * Copy the instructions to the destination address, two pages at a time
@@ -225,14 +277,18 @@ int patch_insn_write(void *addr, const void *insn, size_t len)
 		size = min(len, PAGE_SIZE * 2 - offset_in_page(addr));
 		ret = __patch_insn_write(addr, insn, size);
 		if (ret)
-			return ret;
+			break;
 
 		addr += size;
 		insn += size;
 		len -= size;
 	}
 
-	return 0;
+#ifdef CONFIG_RISCV_M_MODE
+	pmp_text_lock(saved_addr, saved_cfg);
+#endif
+
+	return len ? ret : 0;
 }
 NOKPROBE_SYMBOL(patch_insn_write);
 

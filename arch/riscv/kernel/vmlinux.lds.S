@@ -182,13 +182,13 @@ SECTIONS
 	/*
 	 * Printk ring buffer in SRAM (Sonata nommu).
 	 * Placed at the base of 128KB SRAM; the init_task kernel stack
-	 * occupies the top 8KB (0x0011E000-0x00120000).
+	 * occupies the top THREAD_SIZE bytes of SRAM.
 	 * head.S zeroes only from __sram_end to 0x00120000.
 	 */
 	.sram.data 0x00100000 : AT(0x00100000) {
 		__sram_start = .;
 		*(.sram.data*)
-		. = ALIGN(8192);	/* align to THREAD_SIZE for SRAM stack pool */
+		. = ALIGN(4096);	/* align to THREAD_SIZE for SRAM stack pool */
 		__sram_end = .;
 	}
 

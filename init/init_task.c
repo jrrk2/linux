@@ -72,7 +72,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.stack_refcount	= REFCOUNT_INIT(1),
 #endif
 	.__state	= 0,
-	.stack		= (void *)0x0011e000UL, /* Sonata: SRAM idle stack */
+	.stack		= (void *)(0x00120000UL - THREAD_SIZE), /* Sonata: SRAM idle stack */
 	.usage		= REFCOUNT_INIT(2),
 	.flags		= PF_KTHREAD,
 	.prio		= MAX_PRIO - 20,

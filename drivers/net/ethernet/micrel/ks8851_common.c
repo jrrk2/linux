@@ -234,6 +234,8 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 
 	rxfc = (ks8851_rdreg16(ks, KS_RXFCTR) >> 8) & 0xff;
 
+	dev_info(&ks->netdev->dev, "rx_pkts: rxfc=%d\n", rxfc);
+
 	netif_dbg(ks, rx_status, ks->netdev,
 		  "%s: %d packets\n", __func__, rxfc);
 
@@ -251,8 +253,19 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 		rxstat = ks8851_rdreg16(ks, KS_RXFHSR);
 		rxlen = ks8851_rdreg16(ks, KS_RXFHBCR) & RXFHBCR_CNT_MASK;
 
+		dev_info(&ks->netdev->dev, "rx: stat=0x%04x len=%d\n", rxstat, rxlen);
+
 		netif_dbg(ks, rx_status, ks->netdev,
 			  "rx: stat 0x%04x, len 0x%04x\n", rxstat, rxlen);
+
+		/* Skip invalid frames — corrupt FIFO entries can report
+		 * huge lengths that cause SPI timeouts.  Just dequeue. */
+		if (!(rxstat & RXFSHR_RXFV)) {
+			ks8851_wrreg16(ks, KS_RXQCR,
+				       ks->rc_rxqcr | RXQCR_RRXEF);
+			ks->netdev->stats.rx_errors++;
+			continue;
+		}
 
 		/* the length of the packet includes the 32bit CRC */
 
@@ -282,6 +295,9 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 
 				netif_dbg(ks, pktdata, ks->netdev,
 					  "pkt %12ph\n", &rxpkt[4]);
+
+				dev_info(&ks->netdev->dev,
+					 "rx pkt: %14ph\n", rxpkt + 8);
 
 				skb->protocol = eth_type_trans(skb, ks->netdev);
 				__skb_queue_tail(rxq, skb);
@@ -325,6 +341,10 @@ static void ks8851_irq_work(struct work_struct *work)
 	ks8851_wrreg16(ks, KS_IER, 0x0000);
 
 	status = ks8851_rdreg16(ks, KS_ISR);
+	dev_info(&ks->netdev->dev, "irq_work: ISR=0x%04x rc_ier=0x%04x RXCR1=0x%04x RXFCTR=0x%04x\n",
+		 status, ks->rc_ier,
+		 ks8851_rdreg16(ks, KS_RXCR1),
+		 ks8851_rdreg16(ks, KS_RXFCTR));
 	ks8851_wrreg16(ks, KS_ISR, status);
 
 	if (status & ks->rc_ier) {
@@ -413,6 +433,7 @@ static void ks8851_irq_work(struct work_struct *work)
 static irqreturn_t ks8851_irq_primary(int irq, void *_ks)
 {
 	struct ks8851_net *ks = _ks;
+
 
 	disable_irq_nosync(irq);
 	schedule_work(&ks->irq_work);
@@ -621,6 +642,14 @@ static int ks8851_net_open(struct net_device *dev)
 		ks8851_lock(ks, &flags);
 		ks8851_wrreg16(ks, KS_ISR, 0xFFFF);
 		ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+		{
+			u16 ier_rb = ks8851_rdreg16(ks, KS_IER);
+			u16 isr_rb = ks8851_rdreg16(ks, KS_ISR);
+			u16 rxcr1 = ks8851_rdreg16(ks, KS_RXCR1);
+			u16 txcr = ks8851_rdreg16(ks, KS_TXCR);
+			netdev_info(dev, "open: IER=0x%04x ISR=0x%04x RXCR1=0x%04x TXCR=0x%04x rc_ier=0x%04x\n",
+				    ier_rb, isr_rb, rxcr1, txcr, ks->rc_ier);
+		}
 		ks8851_unlock(ks, &flags);
 		enable_irq(dev->irq);
 	}
