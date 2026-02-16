@@ -2,6 +2,7 @@
  *  LowRISC SD Host Controller Interface driver
  *
  *  Ported for Sonata SoC (RV32, TL-UL bus, 32-bit register access)
+ *  Polling mode — all SD transactions are synchronous.
  *
  *  Copyright (C) 2018 LowRISC CIC
  *  Copyright (C) 2024 Jonathan Kimmitt
@@ -20,7 +21,6 @@
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/scatterlist.h>
-#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
@@ -30,7 +30,6 @@
 #include "lowrisc_sd.h"
 
 #define DRIVER_NAME "lowrisc-sd"
-#define DEBUG
 
 static inline void sd_write(struct lowrisc_sd_host *host, u32 reg, u32 val)
 {
@@ -40,12 +39,6 @@ static inline void sd_write(struct lowrisc_sd_host *host, u32 reg, u32 val)
 static inline u32 sd_read(struct lowrisc_sd_host *host, u32 reg)
 {
 	return readl(host->ioaddr + reg);
-}
-
-static void sd_irq_en(struct lowrisc_sd_host *host, int mask)
-{
-	sd_write(host, SD_IRQ_EN_REG, mask);
-	host->int_en = mask;
 }
 
 static void lowrisc_sd_init(struct lowrisc_sd_host *host)
@@ -61,6 +54,9 @@ static void lowrisc_sd_init(struct lowrisc_sd_host *host)
 	sd_write(host, SD_RESET_REG, 0x7);  /* Deassert: clk_rst | data_rst | cmd_rst */
 }
 
+/* System clock frequency feeding the SD clock divider */
+#define SD_SYS_CLK_HZ	30000000
+
 static void __lowrisc_sd_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 {
 	struct lowrisc_sd_host *host = mmc_priv(mmc);
@@ -74,6 +70,19 @@ static void __lowrisc_sd_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		break;
 	}
 
+	/* Set SD clock divider: sd_clk = SYS_CLK / (2 * (divider + 1)) */
+	if (ios->clock) {
+		unsigned int divider = SD_SYS_CLK_HZ / (2 * ios->clock);
+
+		if (divider > 0)
+			divider--;
+		if (divider > 255)
+			divider = 255;
+		sd_write(host, SD_CLK_DIV_REG, divider);
+		dev_info(&host->pdev->dev, "clock %u Hz, divider %u\n",
+			 SD_SYS_CLK_HZ / (2 * (divider + 1)), divider);
+	}
+
 	switch (ios->bus_width) {
 	case MMC_BUS_WIDTH_1:
 		host->width_setting = 0;
@@ -84,33 +93,12 @@ static void __lowrisc_sd_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	}
 }
 
-static void lowrisc_sd_finish_request(struct lowrisc_sd_host *host)
+static void lowrisc_sd_read_response(struct lowrisc_sd_host *host,
+				     struct mmc_command *cmd)
 {
-	struct mmc_request *mrq = host->mrq;
-
-	host->mrq = NULL;
-	host->cmd = NULL;
-	host->data = NULL;
-
-	sd_write(host, SD_RESET_REG, 0);    /* Assert all resets */
-	sd_write(host, SD_START_REG, 0);
-	sd_write(host, SD_RESET_REG, 0x7);  /* Deassert all resets */
-	mmc_request_done(host->mmc, mrq);
-}
-
-static void lowrisc_sd_cmd_irq(struct lowrisc_sd_host *host)
-{
-	struct mmc_command *cmd = host->cmd;
-
-	if (!cmd) {
-		dev_warn(&host->pdev->dev, "Spurious CMD irq\n");
-		return;
-	}
-	host->cmd = NULL;
-
 	if (cmd->flags & MMC_RSP_PRESENT && cmd->flags & MMC_RSP_136) {
 		int i;
-		/* R2 — 136-bit response */
+		/* R2 -- 136-bit response */
 		for (i = 0; i < 4; i++) {
 			cmd->resp[i] = sd_read(host, SD_RESP0 + (3 - i) * 4) << 8;
 			if (i != 3)
@@ -120,141 +108,63 @@ static void lowrisc_sd_cmd_irq(struct lowrisc_sd_host *host)
 		/* R1, R1B, R3, R6, R7 */
 		cmd->resp[0] = sd_read(host, SD_RESP0);
 	}
-
-	if (host->data)
-		host->int_en |= SD_CARD_RW_END;
-	else
-		lowrisc_sd_finish_request(host);
 }
 
-static void lowrisc_sd_next_block(struct lowrisc_sd_host *host);
-
-static void lowrisc_sd_read_block(struct lowrisc_sd_host *host)
+/*
+ * Poll for command completion (RESP_END bit in IRQ status).
+ * Returns 0 on success, -ETIMEDOUT on timeout.
+ */
+static int lowrisc_sd_poll_cmd(struct lowrisc_sd_host *host)
 {
-	void __iomem *buf_base = host->ioaddr + SD_DATA_BUF_OFFSET;
-	size_t blksize = host->data->blksz;
-	int len;
+	int i;
 
-	BUG_ON(!sg_miter_next(&host->sg_miter));
-	BUG_ON(host->sg_miter.length < blksize);
+	for (i = 0; i < 500000; i++) {
+		u32 status = sd_read(host, SD_IRQ_STAT_RESP);
 
-	if (!((sizeof(u32) - 1) & (size_t)(host->sg_miter.addr))) {
-		u32 *buf = (u32 *)(host->sg_miter.addr);
-		for (len = blksize; len > 0; len -= sizeof(u32))
-			*buf++ = readl(buf_base + (blksize - len));
-	} else {
-		u8 *buf = host->sg_miter.addr;
-		for (len = blksize; len > 0; len -= sizeof(u32)) {
-			u32 scratch = readl(buf_base + (blksize - len));
-			memcpy(buf, &scratch, sizeof(u32));
-			buf += sizeof(u32);
+		if (status & SD_CARD_RESP_END) {
+			sd_write(host, SD_IRQ_CLR_REG, SD_CARD_RESP_END);
+			/* Check hardware timeout counter */
+			if (sd_read(host, SD_WAIT_RESP) >=
+			    sd_read(host, SD_TIMEOUT_RESP))
+				return -ETIMEDOUT;
+			return 0;
 		}
+		udelay(1);
 	}
-	host->sg_miter.consumed = blksize;
-	sg_miter_stop(&host->sg_miter);
+	return -ETIMEDOUT;
 }
 
-static void lowrisc_sd_data_end_irq(struct lowrisc_sd_host *host)
+/*
+ * Poll for data transfer completion (RW_END bit in IRQ status).
+ * Returns 0 on success, -ETIMEDOUT on timeout.
+ */
+static int lowrisc_sd_poll_data(struct lowrisc_sd_host *host)
 {
-	struct mmc_data *data = host->data;
+	int i;
 
-	if (!data) {
-		dev_warn(&host->pdev->dev, "Spurious data end IRQ\n");
-		return;
+	/* Data transfers can take much longer (multi-block reads) */
+	for (i = 0; i < 2000000; i++) {
+		u32 status = sd_read(host, SD_IRQ_STAT_RESP);
+
+		if (status & SD_CARD_RW_END) {
+			sd_write(host, SD_IRQ_CLR_REG, SD_CARD_RW_END);
+			return 0;
+		}
+		udelay(1);
 	}
-
-	if (data->flags & MMC_DATA_READ)
-		lowrisc_sd_read_block(host);
-
-	host->blocks_remaining--;
-	host->block_offset++;
-
-	if (host->blocks_remaining > 0 && data->error == 0) {
-		/* More blocks to transfer — issue next single-block cmd */
-		lowrisc_sd_next_block(host);
-		return;
-	}
-
-	/* All blocks done (or error) */
-	host->data = NULL;
-	if (data->error == 0)
-		data->bytes_xfered = data->blocks * data->blksz;
-	else
-		data->bytes_xfered = 0;
-
-	lowrisc_sd_finish_request(host);
+	return -ETIMEDOUT;
 }
 
-static irqreturn_t lowrisc_sd_irq(int irq, void *dev_id)
-{
-	struct lowrisc_sd_host *host = dev_id;
-	u32 int_status, int_reg;
-	int error = 0;
-	irqreturn_t ret = IRQ_HANDLED;
-
-	spin_lock(&host->lock);
-	int_status = sd_read(host, SD_IRQ_STAT_RESP);
-	int_reg = int_status & host->int_en;
-
-	if (!int_reg) {
-		ret = IRQ_NONE;
-		goto irq_end;
-	}
-
-	/* Clear handled interrupt bits (write-1-to-clear) */
-	sd_write(host, SD_IRQ_CLR_REG, int_reg);
-
-	/* Check for timeout only on command completion — the wait counter
-	 * is only meaningful for the command that just finished.
-	 */
-	if ((int_reg & SD_CARD_RESP_END) &&
-	    sd_read(host, SD_WAIT_RESP) >= sd_read(host, SD_TIMEOUT_RESP)) {
-		error = -ETIMEDOUT;
-		dev_info(&host->pdev->dev, "IRQ: timeout error\n");
-		if (host->cmd)
-			host->cmd->error = error;
-		sd_write(host, SD_START_REG, 0);
-		sd_write(host, SD_SETTING_REG, 0);
-	}
-
-	/* Card insert/remove */
-	if (int_reg & SD_CARD_CARD_REMOVED) {
-		int mask = (host->int_en & ~SD_CARD_CARD_REMOVED) | SD_CARD_CARD_INSERTED;
-		sd_irq_en(host, mask);
-		mmc_detect_change(host->mmc, 1);
-	}
-
-	if (int_reg & SD_CARD_CARD_INSERTED) {
-		int mask = (host->int_en & ~SD_CARD_CARD_INSERTED) | SD_CARD_CARD_REMOVED;
-		sd_irq_en(host, mask);
-		lowrisc_sd_init(host);
-		mmc_detect_change(host->mmc, 1);
-	}
-
-	/* Command completion */
-	if (int_reg & SD_CARD_RESP_END) {
-		lowrisc_sd_cmd_irq(host);
-		host->int_en &= ~SD_CARD_RESP_END;
-	}
-
-	/* Data transfer completion */
-	if (int_reg & SD_CARD_RW_END) {
-		lowrisc_sd_data_end_irq(host);
-		host->int_en &= ~SD_CARD_RW_END;
-	}
-
-irq_end:
-	sd_irq_en(host, host->int_en);
-	spin_unlock(&host->lock);
-	return ret;
-}
-
-static void lowrisc_sd_start_cmd(struct lowrisc_sd_host *host,
-				 struct mmc_command *cmd)
+/*
+ * Send a command to the SD controller and start it.
+ * Does NOT wait for completion — caller must poll.
+ */
+static void lowrisc_sd_send_cmd(struct lowrisc_sd_host *host,
+				struct mmc_command *cmd,
+				struct mmc_data *data)
 {
 	int setting = 0;
 	int timeout = 100000;  /* ~0.5s at 200kHz init clock */
-	struct mmc_data *data = host->data;
 
 	if (!(cmd->flags & MMC_RSP_PRESENT))
 		setting = 0;
@@ -264,7 +174,6 @@ static void lowrisc_sd_start_cmd(struct lowrisc_sd_host *host,
 		setting = 1;
 
 	setting |= host->width_setting;
-	host->cmd = cmd;
 
 	if (data) {
 		setting |= 0x4;
@@ -275,9 +184,10 @@ static void lowrisc_sd_start_cmd(struct lowrisc_sd_host *host,
 	}
 
 	/* Reset cmd (and data if applicable) to clear finish signals */
-	sd_write(host, SD_RESET_REG, 0);  /* Assert all resets */
+	sd_write(host, SD_RESET_REG, 0);    /* Assert all resets */
 	sd_write(host, SD_START_REG, 0);
 	sd_write(host, SD_RESET_REG, 0x7);  /* Deassert all resets */
+	sd_write(host, SD_IRQ_CLR_REG, 0xf); /* Clear any stale status */
 
 	/* Set up the command */
 	sd_write(host, SD_ALIGN_REG, 0);
@@ -287,89 +197,56 @@ static void lowrisc_sd_start_cmd(struct lowrisc_sd_host *host,
 	sd_write(host, SD_TIMEOUT_REG, timeout);
 	/* Start the transaction */
 	sd_write(host, SD_START_REG, 1);
-	sd_irq_en(host, sd_read(host, SD_IRQ_EN_RESP) | SD_CARD_RESP_END);
 }
 
-static void lowrisc_sd_write_block(struct lowrisc_sd_host *host)
+static void lowrisc_sd_write_data(struct lowrisc_sd_host *host,
+				  struct mmc_data *data,
+				  struct sg_mapping_iter *sg_miter)
 {
 	void __iomem *buf_base = host->ioaddr + SD_DATA_BUF_OFFSET;
-	size_t blksize = host->data->blksz;
-	int len;
+	size_t total = data->blocks * data->blksz;
+	size_t offset = 0;
 
-	if (sg_miter_next(&host->sg_miter)) {
-		BUG_ON(host->sg_miter.length < blksize);
+	while (sg_miter_next(sg_miter) && offset < total) {
+		size_t len = min(sg_miter->length, total - offset);
+		u32 *src = sg_miter->addr;
+		size_t i;
 
-		if (!((sizeof(u32) - 1) & (size_t)(host->sg_miter.addr))) {
-			u32 *buf = (u32 *)(host->sg_miter.addr);
-			for (len = blksize; len > 0; len -= sizeof(u32))
-				writel(*buf++, buf_base + (blksize - len));
-		} else {
-			u8 *buf = host->sg_miter.addr;
-			for (len = blksize; len > 0; len -= sizeof(u32)) {
-				u32 scratch;
-				memcpy(&scratch, buf, sizeof(u32));
-				buf += sizeof(u32);
-				writel(scratch, buf_base + (blksize - len));
-			}
-		}
-		host->sg_miter.consumed = blksize;
-		sg_miter_stop(&host->sg_miter);
+		for (i = 0; i < len; i += sizeof(u32))
+			writel(*src++, buf_base + offset + i);
+		sg_miter->consumed = len;
+		offset += len;
 	}
+	sg_miter_stop(sg_miter);
 }
 
-static void lowrisc_sd_start_data(struct lowrisc_sd_host *host,
-				  struct mmc_data *data)
+static void lowrisc_sd_read_data(struct lowrisc_sd_host *host,
+				 struct mmc_data *data,
+				 struct sg_mapping_iter *sg_miter)
 {
-	unsigned int flags = SG_MITER_ATOMIC;
+	void __iomem *buf_base = host->ioaddr + SD_DATA_BUF_OFFSET;
+	size_t total = data->blocks * data->blksz;
+	size_t offset = 0;
 
-	host->data = data;
-	host->blocks_remaining = data->blocks;
-	host->block_offset = 0;
+	while (sg_miter_next(sg_miter) && offset < total) {
+		size_t len = min(sg_miter->length, total - offset);
+		u32 *dst = sg_miter->addr;
+		size_t i;
 
-	if (data->flags & MMC_DATA_READ)
-		flags |= SG_MITER_TO_SG;
-	else
-		flags |= SG_MITER_FROM_SG;
-
-	sg_miter_start(&host->sg_miter, data->sg, data->sg_len, flags);
-
-	/* Always tell hardware single block — we iterate in the driver */
-	sd_write(host, SD_BLKCNT_REG, 1);
-	sd_write(host, SD_BLKSIZE_REG, data->blksz);
-
-	if (!(data->flags & MMC_DATA_READ))
-		lowrisc_sd_write_block(host);
-}
-
-/* Issue the next single-block command for a multi-block transfer */
-static void lowrisc_sd_next_block(struct lowrisc_sd_host *host)
-{
-	struct mmc_command *cmd = &host->block_cmd;
-
-	/* Set up hardware for next single block */
-	sd_write(host, SD_BLKCNT_REG, 1);
-	sd_write(host, SD_BLKSIZE_REG, host->data->blksz);
-
-	/* Fill buffer for writes */
-	if (!(host->data->flags & MMC_DATA_READ))
-		lowrisc_sd_write_block(host);
-
-	/* Synthesise a single-block command */
-	memset(cmd, 0, sizeof(*cmd));
-	if (host->data->flags & MMC_DATA_READ)
-		cmd->opcode = MMC_READ_SINGLE_BLOCK;
-	else
-		cmd->opcode = MMC_WRITE_BLOCK;
-	cmd->arg = host->orig_arg + host->block_offset;
-	cmd->flags = MMC_RSP_R1 | MMC_CMD_ADTC;
-
-	lowrisc_sd_start_cmd(host, cmd);
+		for (i = 0; i < len; i += sizeof(u32))
+			*dst++ = readl(buf_base + offset + i);
+		sg_miter->consumed = len;
+		offset += len;
+	}
+	sg_miter_stop(sg_miter);
 }
 
 static void lowrisc_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
 {
 	struct lowrisc_sd_host *host = mmc_priv(mmc);
-	unsigned long flags;
+	struct mmc_data *data = mrq->data;
+	struct sg_mapping_iter sg_miter;
+	int ret;
 
 	/* Abort if card not present */
 	if (sd_read(host, SD_DETECT_RESP)) {
@@ -378,25 +255,93 @@ static void lowrisc_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
 		return;
 	}
 
-	spin_lock_irqsave(&host->lock, flags);
-
-	WARN_ON(host->mrq != NULL);
-	host->mrq = mrq;
-
-	if (mrq->data) {
-		host->orig_arg = mrq->cmd->arg;
-		lowrisc_sd_start_data(host, mrq->data);
-
-		/* Convert multi-block commands to single-block */
-		if (mrq->cmd->opcode == MMC_READ_MULTIPLE_BLOCK)
-			mrq->cmd->opcode = MMC_READ_SINGLE_BLOCK;
-		else if (mrq->cmd->opcode == MMC_WRITE_MULTIPLE_BLOCK)
-			mrq->cmd->opcode = MMC_WRITE_BLOCK;
+	/* CMD23 (set block count) if present */
+	if (mrq->sbc) {
+		lowrisc_sd_send_cmd(host, mrq->sbc, NULL);
+		ret = lowrisc_sd_poll_cmd(host);
+		if (ret) {
+			mrq->sbc->error = ret;
+			dev_err(&host->pdev->dev, "CMD%d timeout\n",
+				mrq->sbc->opcode);
+			goto done;
+		}
+		lowrisc_sd_read_response(host, mrq->sbc);
 	}
 
-	lowrisc_sd_start_cmd(host, mrq->cmd);
+	/* Set up data transfer if present */
+	if (data) {
+		unsigned int flags = SG_MITER_ATOMIC;
 
-	spin_unlock_irqrestore(&host->lock, flags);
+		if (data->flags & MMC_DATA_READ)
+			flags |= SG_MITER_TO_SG;
+		else
+			flags |= SG_MITER_FROM_SG;
+
+		sg_miter_start(&sg_miter, data->sg, data->sg_len, flags);
+
+		sd_write(host, SD_BLKCNT_REG, data->blocks);
+		sd_write(host, SD_BLKSIZE_REG, data->blksz);
+
+		/* For writes, fill the buffer before sending the command */
+		if (!(data->flags & MMC_DATA_READ))
+			lowrisc_sd_write_data(host, data, &sg_miter);
+	}
+
+	/* Send the main command */
+	lowrisc_sd_send_cmd(host, mrq->cmd, data);
+	ret = lowrisc_sd_poll_cmd(host);
+	if (ret) {
+		mrq->cmd->error = ret;
+		if (mrq->cmd->opcode != 8 /* SD_SEND_IF_COND */ &&
+		    mrq->cmd->opcode != MMC_APP_CMD)
+			dev_err(&host->pdev->dev, "CMD%d timeout\n",
+				mrq->cmd->opcode);
+		if (data)
+			sg_miter_stop(&sg_miter);
+		goto done;
+	}
+	lowrisc_sd_read_response(host, mrq->cmd);
+
+	/* Wait for data transfer completion */
+	if (data) {
+		ret = lowrisc_sd_poll_data(host);
+		if (ret) {
+			data->error = ret;
+			dev_err(&host->pdev->dev,
+				"data timeout on CMD%d (%u blocks)\n",
+				mrq->cmd->opcode, data->blocks);
+			sg_miter_stop(&sg_miter);
+			goto done;
+		}
+
+		/* Read data from buffer after transfer */
+		if (data->flags & MMC_DATA_READ)
+			lowrisc_sd_read_data(host, data, &sg_miter);
+
+		data->bytes_xfered = data->blocks * data->blksz;
+	}
+
+	/* Stop command (CMD12) if present — skip when CMD23 was used,
+	 * since the card auto-stops after the pre-defined block count.
+	 */
+	if (mrq->stop && !mrq->sbc) {
+		lowrisc_sd_send_cmd(host, mrq->stop, NULL);
+		ret = lowrisc_sd_poll_cmd(host);
+		if (ret) {
+			mrq->stop->error = ret;
+			dev_err(&host->pdev->dev, "CMD%d (stop) timeout\n",
+				mrq->stop->opcode);
+			goto done;
+		}
+		lowrisc_sd_read_response(host, mrq->stop);
+	}
+
+done:
+	/* Reset the SD engine */
+	sd_write(host, SD_RESET_REG, 0);
+	sd_write(host, SD_START_REG, 0);
+	sd_write(host, SD_RESET_REG, 0x7);
+	mmc_request_done(mmc, mrq);
 }
 
 static void lowrisc_sd_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
@@ -434,15 +379,10 @@ static int lowrisc_sd_probe(struct platform_device *pdev)
 	struct lowrisc_sd_host *host;
 	struct mmc_host *mmc;
 	struct resource *iomem;
-	int irq;
 
 	iomem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!iomem)
 		return -EINVAL;
-
-	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
 
 	mmc = mmc_alloc_host(sizeof(struct lowrisc_sd_host), &pdev->dev);
 	if (!mmc)
@@ -464,14 +404,14 @@ static int lowrisc_sd_probe(struct platform_device *pdev)
 			 iomem, ver);
 	}
 
-	/* Set MMC host parameters — 1-bit bus only (DAT1/DAT2 not connected) */
+	/* Set MMC host parameters */
 	mmc->ops = &lowrisc_sd_ops;
-	mmc->caps = 0;  /* No 4-bit support */
+	mmc->caps = MMC_CAP_4_BIT_DATA | MMC_CAP_CMD23;
 	mmc->caps2 = MMC_CAP2_NO_SDIO;  /* Skip SDIO probe (CMD52) */
 	mmc->ocr_avail = MMC_VDD_32_33;
 	mmc->f_min = 400000;     /* 400 kHz for init */
 	mmc->f_max = 15000000;   /* 30 MHz / 2 */
-	mmc->max_blk_count = 8;  /* Multi-block broken into single-block HW ops */
+	mmc->max_blk_count = 8;  /* 8 x 512 = 4KB hardware buffer limit */
 	mmc->max_blk_size = 512;
 	mmc->max_req_size = 4096;  /* Must be >= PAGE_SIZE for block layer */
 	mmc->max_seg_size = 4096;
@@ -481,19 +421,11 @@ static int lowrisc_sd_probe(struct platform_device *pdev)
 
 	lowrisc_sd_init(host);
 
-	ret = devm_request_irq(&pdev->dev, irq, lowrisc_sd_irq, IRQF_SHARED,
-			       DRIVER_NAME, host);
-	if (ret) {
-		dev_err(&pdev->dev, "Failed to request IRQ %d\n", irq);
-		goto free_host;
-	}
-
 	ret = mmc_add_host(mmc);
 	if (ret)
 		goto free_host;
 
-	dev_info(&pdev->dev, "LowRISC SD host controller, IRQ %d\n", irq);
-	sd_irq_en(host, SD_CARD_CARD_INSERTED | SD_CARD_CARD_REMOVED);
+	dev_info(&pdev->dev, "LowRISC SD host controller (polling mode)\n");
 	return 0;
 
 free_host:
@@ -506,7 +438,6 @@ static void lowrisc_sd_remove(struct platform_device *pdev)
 	struct lowrisc_sd_host *host = platform_get_drvdata(pdev);
 
 	mmc_remove_host(host->mmc);
-	sd_write(host, SD_IRQ_EN_REG, 0);  /* Mask all interrupts */
 	mmc_free_host(host->mmc);
 }
 

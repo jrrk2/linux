@@ -131,7 +131,7 @@
 
 		sd0: sd@80500000 {
 			compatible = "lowrisc,sd-host";
-			reg = <0x80500000 0x1000>;
+			reg = <0x80500000 0x2000>;
 			interrupts = <5>;
 			clocks = <&sysclk>;
 		};

@@ -57,8 +57,8 @@
 #define SD_IRQ_EN_RESP    (27 * 4)
 #define SD_VERSION_RESP   (15 * 4)  /* RTL version register */
 
-/* Data buffer offset: 512 bytes at 0x200 */
-#define SD_DATA_BUF_OFFSET  0x200
+/* Data buffer offset: 4KB at 0x1000 */
+#define SD_DATA_BUF_OFFSET  0x1000
 
 /* IRQ status/enable bits */
 #define SD_CARD_RESP_END       0x01
@@ -70,18 +70,9 @@ struct lowrisc_sd_host {
 	struct platform_device *pdev;
 	struct mmc_host *mmc;
 	spinlock_t lock;
-	struct mmc_request *mrq;
-	struct mmc_command *cmd;
-	struct mmc_data *data;
-	struct sg_mapping_iter sg_miter;
 	void __iomem *ioaddr;
 	int int_en;
 	int width_setting;
-	/* Multi-block state: break multi-block into single-block HW ops */
-	unsigned int blocks_remaining;
-	unsigned int block_offset;
-	u32 orig_arg;
-	struct mmc_command block_cmd;  /* synthetic cmd for subsequent blocks */
 };
 
 #endif /* _LOWRISC_SD_H_ */
