@@ -55,7 +55,7 @@ static void lowrisc_sd_init(struct lowrisc_sd_host *host)
 }
 
 /* System clock frequency feeding the SD clock divider */
-#define SD_SYS_CLK_HZ	30000000
+#define SD_SYS_CLK_HZ	40000000
 
 static void __lowrisc_sd_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 {

@@ -328,9 +328,24 @@ SYM_CODE_START(_start_kernel)
 
 #ifndef CONFIG_XIP_KERNEL
 	/*
-	 * Zero SRAM above the printk ring buffer (which is placed at the
-	 * base of SRAM by the linker).  __sram_end marks the first free
-	 * byte; the init_task stack lives at the top of SRAM.
+	 * Copy .sram.data from its LMA (after kernel image in HyperRAM)
+	 * to its VMA in SRAM at 0x00100000.  The linker script sets
+	 * LMA != VMA so the binary Image has no ~1 GB gap.
+	 */
+	la a3, __sram_lma		/* source: LMA in HyperRAM */
+	la a4, __sram_start		/* dest: VMA in SRAM */
+	la a5, __sram_end
+.Lcopy_sram:
+	lw a6, 0(a3)
+	sw a6, 0(a4)
+	addi a3, a3, 4
+	addi a4, a4, 4
+	blt a4, a5, .Lcopy_sram
+
+	/*
+	 * Zero SRAM above the printk ring buffer.
+	 * __sram_end marks the first free byte; the init_task kernel
+	 * stack lives at the top of SRAM (0x00120000).
 	 */
 	la a3, __sram_end
 	li a4, 0x00120000

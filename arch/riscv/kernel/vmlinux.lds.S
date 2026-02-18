@@ -181,16 +181,17 @@ SECTIONS
 
 	/*
 	 * Printk ring buffer in SRAM (Sonata nommu).
-	 * Placed at the base of 128KB SRAM; the init_task kernel stack
-	 * occupies the top THREAD_SIZE bytes of SRAM.
-	 * head.S zeroes only from __sram_end to 0x00120000.
+	 * VMA is in SRAM at 0x00100000; LMA follows the kernel image
+	 * so that objcopy -O binary doesn't create a ~1 GB gap.
+	 * head.S copies from LMA to VMA, then zeroes the rest of SRAM.
 	 */
-	.sram.data 0x00100000 : AT(0x00100000) {
+	.sram.data 0x00100000 : AT(_end) {
 		__sram_start = .;
 		*(.sram.data*)
 		. = ALIGN(4096);	/* align to THREAD_SIZE for SRAM stack pool */
 		__sram_end = .;
 	}
+	__sram_lma = LOADADDR(.sram.data);
 
 	STABS_DEBUG
 	DWARF_DEBUG

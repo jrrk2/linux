@@ -2,11 +2,8 @@
 /*
  * OpenTitan SPI host controller driver for lowRISC Sonata.
  *
- * This drives the OpenTitan SPI host IP block, which has:
- * - 8-entry TX and RX FIFOs (byte-wide)
- * - Manual chip-select control
- * - Separate TX/RX enable bits supporting full-duplex
- * - Transfer length programmed via START register
+ * This drives the OpenTitan SPI host IP block with memory-mapped
+ * TX/RX buffers (2048 bytes each) for bulk transfers.
  *
  * The hardware only supports a single START per CS assertion, so
  * multi-transfer SPI messages are merged into one START command
@@ -14,12 +11,16 @@
  *
  * Register map:
  *   0x0C  CFG      [RW]  half_clk_period[15:0], msb_first[29], cpha[30], cpol[31]
- *   0x10  CONTROL  [RW]  tx_clear[0], rx_clear[1], tx_en[2], rx_en[3]
- *   0x14  STATUS   [RO]  tx_lvl[7:0], rx_lvl[15:8], tx_full[16], rx_empty[17], idle[18]
+ *   0x10  CONTROL  [RW]  tx_clear[0], rx_clear[1], tx_en[2], rx_en[3], sw_reset[31]
+ *   0x14  STATUS   [RO]  tx_lvl[11:0], rx_lvl[23:12], tx_full[24], rx_empty[25], idle[26]
  *   0x18  START    [WO]  byte_count[10:0]
  *   0x1C  RX_FIFO  [RO]  data[7:0]
  *   0x20  TX_FIFO  [WO]  data[7:0]
  *   0x28  CS       [RW]  per-bit chip-select (active low)
+ *
+ * Buffer map (within same 8KB region):
+ *   0x1000-0x17FF  TX buffer (2048 bytes, CPU writes, HW reads)
+ *   0x1800-0x1FFF  RX buffer (2048 bytes, HW writes, CPU reads)
  *
  * Copyright (C) 2026 Jonathan
  */
@@ -44,17 +45,20 @@
 #define OT_SPI_INFO		0x24
 #define OT_SPI_CS		0x28
 
+/* Memory-mapped buffer offsets */
+#define OT_SPI_TX_BUF		0x1000
+#define OT_SPI_RX_BUF		0x1800
+#define OT_SPI_BUF_SIZE	2048
+
 /* CONTROL bits */
 #define OT_SPI_CTRL_TX_FLUSH	BIT(0)
 #define OT_SPI_CTRL_RX_FLUSH	BIT(1)
 #define OT_SPI_CTRL_TX_EN	BIT(2)
 #define OT_SPI_CTRL_RX_EN	BIT(3)
+#define OT_SPI_CTRL_SW_RESET	BIT(31)
 
 /* STATUS bits */
-#define OT_SPI_STATUS_TX_LVL_MASK	0xFF
-#define OT_SPI_STATUS_RX_LVL_SHIFT	8
-#define OT_SPI_STATUS_RX_LVL_MASK	0xFF
-#define OT_SPI_STATUS_IDLE		BIT(18)
+#define OT_SPI_STATUS_IDLE	BIT(26)
 
 struct ot_spi {
 	void __iomem *base;
@@ -87,12 +91,6 @@ static int ot_spi_wait_idle(struct ot_spi *spi)
 	return 0;
 }
 
-static int ot_spi_rx_avail(struct ot_spi *spi)
-{
-	return (ot_spi_read(spi, OT_SPI_STATUS) >> OT_SPI_STATUS_RX_LVL_SHIFT)
-	       & OT_SPI_STATUS_RX_LVL_MASK;
-}
-
 static void ot_spi_set_cs(struct spi_device *device, bool is_high)
 {
 	struct ot_spi *spi = spi_controller_get_devdata(device->controller);
@@ -110,31 +108,20 @@ static void ot_spi_set_cs(struct spi_device *device, bool is_high)
 }
 
 /*
- * Handle an entire SPI message as a single hardware transaction.
+ * Handle an entire SPI message as a single hardware transaction using
+ * the memory-mapped TX/RX buffers.
  *
- * The OpenTitan SPI host does not support issuing multiple START commands
- * within one CS assertion.  We therefore sum the byte counts of every
- * transfer in the message, issue one START, and stream TX/RX data across
- * the transfer boundaries.
- *
- * Because the hardware FIFOs are only 8 bytes deep, TX writes and RX reads
- * must be interleaved for messages longer than 8 bytes when RX is enabled.
- * Otherwise the RX FIFO fills up, the hardware stalls, the TX FIFO fills,
- * and we deadlock.
+ * All transfers in the message are concatenated into the TX buffer,
+ * a single START is issued, and RX data is read back from the RX buffer.
  */
 static int ot_spi_transfer_one_message(struct spi_controller *host,
 				       struct spi_message *msg)
 {
 	struct ot_spi *spi = spi_controller_get_devdata(host);
 	struct spi_transfer *xfer;
-	struct spi_transfer *tx_xfer, *rx_xfer;
 	unsigned int total_len = 0;
-	unsigned int tx_off = 0, rx_off = 0;
-	unsigned int tx_done = 0, rx_done = 0;
-	unsigned int rx_total;
+	unsigned int off;
 	bool need_rx = false;
-	unsigned long timeout;
-	u32 ctrl;
 	int ret;
 
 	/* Calculate total byte count and check if any transfer needs RX */
@@ -149,7 +136,12 @@ static int ot_spi_transfer_one_message(struct spi_controller *host,
 		goto done;
 	}
 
-	rx_total = need_rx ? total_len : 0;
+	if (total_len > OT_SPI_BUF_SIZE) {
+		dev_err(&host->dev, "message too large (%u > %u)\n",
+			total_len, OT_SPI_BUF_SIZE);
+		ret = -EMSGSIZE;
+		goto done;
+	}
 
 	ret = ot_spi_wait_idle(spi);
 	if (ret) {
@@ -157,93 +149,49 @@ static int ot_spi_transfer_one_message(struct spi_controller *host,
 		goto flush;
 	}
 
-	/* Flush FIFOs to ensure clean state */
+	/* Fill TX buffer from all transfers */
+	off = 0;
+	list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+		if (xfer->tx_buf)
+			memcpy_toio(spi->base + OT_SPI_TX_BUF + off,
+				    xfer->tx_buf, xfer->len);
+		else
+			memset_io(spi->base + OT_SPI_TX_BUF + off,
+				  0, xfer->len);
+		off += xfer->len;
+	}
+
+	/* Flush FIFOs, enable TX (+RX if needed) */
 	ot_spi_write(spi, OT_SPI_CONTROL,
 		     OT_SPI_CTRL_TX_FLUSH | OT_SPI_CTRL_RX_FLUSH);
+	ot_spi_write(spi, OT_SPI_CONTROL,
+		     OT_SPI_CTRL_TX_EN |
+		     (need_rx ? OT_SPI_CTRL_RX_EN : 0));
 
 	/* Assert chip select */
 	ot_spi_set_cs(msg->spi, false);
 
-	/* Always TX_EN for clock generation; RX_EN if any transfer reads */
-	ctrl = OT_SPI_CTRL_TX_EN;
-	if (need_rx)
-		ctrl |= OT_SPI_CTRL_RX_EN;
-	ot_spi_write(spi, OT_SPI_CONTROL, ctrl);
-
 	/* Single START for the entire message */
 	ot_spi_write(spi, OT_SPI_START, total_len);
 
-	/*
-	 * Interleave TX writes and RX reads.  For every byte we push into
-	 * the TX FIFO the hardware clocks one byte in from MISO (if RX_EN).
-	 * With only 8-byte FIFOs we must drain RX while feeding TX to
-	 * prevent either FIFO from blocking the shift engine.
-	 */
-	tx_xfer = list_first_entry(&msg->transfers,
-				   struct spi_transfer, transfer_list);
-	rx_xfer = tx_xfer;
-	timeout = jiffies + msecs_to_jiffies(500);
-
-	while (tx_done < total_len || rx_done < rx_total) {
-		u32 status = ot_spi_read(spi, OT_SPI_STATUS);
-
-		/* Feed TX FIFO if not full and we have more to send */
-		if (tx_done < total_len && !(status & BIT(16))) {
-			const u8 *tx = tx_xfer->tx_buf;
-
-			ot_spi_write(spi, OT_SPI_TX_FIFO,
-				     tx ? tx[tx_off] : 0x00);
-			tx_off++;
-			tx_done++;
-			if (tx_off >= tx_xfer->len && tx_done < total_len) {
-				tx_xfer = list_next_entry(tx_xfer,
-							  transfer_list);
-				tx_off = 0;
-			}
-		}
-
-		/* Drain RX FIFO while data is available */
-		if (rx_done < rx_total) {
-			unsigned int rx_lvl;
-
-			rx_lvl = (status >> OT_SPI_STATUS_RX_LVL_SHIFT)
-				 & OT_SPI_STATUS_RX_LVL_MASK;
-			while (rx_lvl && rx_done < rx_total) {
-				u8 *rx = rx_xfer->rx_buf;
-				u8 val = (u8)ot_spi_read(spi,
-							 OT_SPI_RX_FIFO);
-				if (rx)
-					rx[rx_off] = val;
-				rx_off++;
-				rx_done++;
-				rx_lvl--;
-				if (rx_off >= rx_xfer->len &&
-				    rx_done < rx_total) {
-					rx_xfer = list_next_entry(rx_xfer,
-								  transfer_list);
-					rx_off = 0;
-				}
-			}
-		}
-
-		if (time_after(jiffies, timeout)) {
-			dev_err(&host->dev,
-				"SPI timeout, STATUS=0x%08x tx=%u/%u rx=%u/%u\n",
-				ot_spi_read(spi, OT_SPI_STATUS),
-				tx_done, total_len, rx_done, rx_total);
-			ret = -ETIMEDOUT;
-			goto cs_off;
-		}
-
-		cpu_relax();
-	}
-
-	/* Wait for hardware to finish clocking the last bytes */
+	/* Wait for transfer to complete */
 	ret = ot_spi_wait_idle(spi);
 	if (ret) {
-		dev_err(&host->dev, "SPI idle timeout, STATUS=0x%08x\n",
+		dev_err(&host->dev, "SPI transfer timeout, STATUS=0x%08x\n",
 			ot_spi_read(spi, OT_SPI_STATUS));
 		goto cs_off;
+	}
+
+	/* Read RX buffer back to transfers that need it */
+	if (need_rx) {
+		off = 0;
+		list_for_each_entry(xfer, &msg->transfers, transfer_list) {
+			if (xfer->rx_buf)
+				memcpy_fromio(xfer->rx_buf,
+					      spi->base + OT_SPI_RX_BUF + off,
+					      xfer->len);
+			off += xfer->len;
+		}
 	}
 
 	msg->actual_length = total_len;
@@ -252,7 +200,6 @@ cs_off:
 	ot_spi_set_cs(msg->spi, true);
 flush:
 	if (ret) {
-		/* Flush FIFOs so the next transaction starts clean */
 		ot_spi_write(spi, OT_SPI_CONTROL,
 			     OT_SPI_CTRL_TX_FLUSH | OT_SPI_CTRL_RX_FLUSH);
 	}
@@ -264,7 +211,7 @@ done:
 
 static size_t ot_spi_max_message_size(struct spi_device *spi)
 {
-	return 2047; /* START register is 11 bits */
+	return OT_SPI_BUF_SIZE;
 }
 
 #ifdef CONFIG_GPIOLIB
@@ -326,7 +273,8 @@ static int ot_spi_probe(struct platform_device *pdev)
 	host->max_speed_hz = 25000000;
 	host->max_message_size = ot_spi_max_message_size;
 
-	/* Flush FIFOs — controller won't report IDLE without this */
+	/* Software reset + flush */
+	ot_spi_write(spi, OT_SPI_CONTROL, OT_SPI_CTRL_SW_RESET);
 	ot_spi_write(spi, OT_SPI_CONTROL,
 		     OT_SPI_CTRL_TX_FLUSH | OT_SPI_CTRL_RX_FLUSH);
 

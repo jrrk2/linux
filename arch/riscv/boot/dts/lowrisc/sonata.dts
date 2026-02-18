@@ -94,9 +94,9 @@
 			status = "disabled";
 		};
 
-		spi_ethmac: spi@80301000 {
+		spi_ethmac: spi@80308000 {
 			compatible = "lowrisc,opentitan-spi";
-			reg = <0x80301000 0x1000>;
+			reg = <0x80308000 0x2000>;
 			interrupts = <25>;
 			clocks = <&sysclk>;
 			#address-cells = <1>;
