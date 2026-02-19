@@ -111,8 +111,8 @@ static inline bool switch_to_should_flush_icache(struct task_struct *task)
 #endif
 
 /*
- * ePMP stack guard: update PMP entry 3 to protect the bottom of the
- * next task's stack.  Entry 3 is locked (enforces in M-mode) but
+ * ePMP stack guard: update PMP entry 5 to protect the bottom of the
+ * next task's stack.  Entry 5 is locked (enforces in M-mode) but
  * mseccfg.RLB allows modification.  Only the address changes; the
  * config (L|NAPOT, no RWX) is set once at boot.
  */
@@ -121,7 +121,7 @@ static inline void __switch_to_pmp_guard(struct task_struct *next)
 {
 	unsigned long guard = (unsigned long)next->stack;
 
-	csr_write(CSR_PMPADDR0 + 3, (guard >> 2) | PMP_GUARD_NAPOT_MASK);
+	csr_write(CSR_PMPADDR0 + 5, (guard >> 2) | PMP_GUARD_NAPOT_MASK);
 }
 #else
 #define __switch_to_pmp_guard(next) do { } while (0)

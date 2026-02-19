@@ -12,6 +12,11 @@
 typedef struct {
 #ifndef CONFIG_MMU
 	unsigned long	end_brk;
+	unsigned long	pmp_xlate_virt;	/* nonzero = PMP offset translation active */
+	unsigned long	pmp_text_offset;/* phys = virt + offset (text/flash region) */
+	unsigned long	pmp_data_offset;/* phys = virt + offset (data/RAM region) */
+	unsigned long	pmp_data_vaddr;	/* boundary between text and data regions */
+	unsigned long	pmp_data_end;	/* end of data region (virtual) */
 #else
 	atomic_long_t id;
 #endif
@@ -40,6 +45,14 @@ typedef struct {
 
 void __meminit create_pgd_mapping(pgd_t *pgdp, uintptr_t va, phys_addr_t pa, phys_addr_t sz,
 				  pgprot_t prot);
+
+#ifdef CONFIG_RISCV_M_MODE
+void riscv_pmp_xlate_setup(unsigned long text_vaddr, unsigned long data_vaddr,
+			   unsigned long data_end_vaddr,
+			   unsigned long textpos_phys, unsigned long datapos_phys);
+void riscv_pmp_xlate_clear(void);
+#endif
+
 #endif /* __ASSEMBLER__ */
 
 #endif /* _ASM_RISCV_MMU_H */

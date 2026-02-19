@@ -240,7 +240,10 @@ SYM_CODE_START(_start_kernel)
 	/*
 	 * Enable ePMP RLB so we can clear locked PMP entries from a
 	 * previous boot (GDB reload without full CPU reset), then
-	 * set entry 0 = full-RWX NAPOT catch-all.
+	 * set entry 6 = full-RWX NAPOT catch-all.  Using entry 6
+	 * (lowest available priority) leaves entries 0-2 free for
+	 * higher-priority PMP offset translation (binfmt_elf_pmp).
+	 * Entry 7 is not available on this Ibex configuration.
 	 * Each phase has its own trap target so a failure in one
 	 * doesn't skip subsequent phases.
 	 */
@@ -253,15 +256,16 @@ SYM_CODE_START(_start_kernel)
 
 	la a0, .Lpmp_done
 	csrw CSR_TVEC, a0
-	/* Clear pmpcfg1 (entries 4-7) — no locked entries here */
-	csrw CSR_PMPCFG0 + 1, zero
-	/* Clear pmpcfg0 entirely (RLB lets us modify locked bytes) and
-	 * set entry 0 = full-RWX NAPOT in one write.
+	/*
+	 * Set entry 6 catch-all FIRST (before clearing other entries)
+	 * to avoid a window with no PMP coverage if MMWP is sticky.
 	 */
-	li a0, (PMP_A_NAPOT | PMP_R | PMP_W | PMP_X)
-	csrw CSR_PMPCFG0, a0
 	li a0, -1
-	csrw CSR_PMPADDR0, a0
+	csrw CSR_PMPADDR0 + 6, a0
+	li a0, ((PMP_A_NAPOT | PMP_R | PMP_W | PMP_X) << 16)
+	csrw CSR_PMPCFG0 + 1, a0
+	/* Now safe to clear entries 0-3 (entry 6 provides coverage) */
+	csrw CSR_PMPCFG0, zero
 .align 2
 .Lpmp_done:
 

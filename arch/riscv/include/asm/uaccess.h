@@ -510,6 +510,31 @@ static inline int __access_ok(const void __user *ptr, unsigned long size)
 	if (addr >= 0x00100000UL && end <= 0x00120000UL)
 		return 1;
 
+	/*
+	 * PMP offset translation: validate start address is in a
+	 * PMP-translated region.  PMP hardware enforces actual bounds
+	 * on each access, so we only need to check the start here.
+	 * (strnlen_user etc. pass speculative MAX_ARG_STRLEN sizes.)
+	 */
+	if (current->mm && current->mm->context.pmp_xlate_virt &&
+	    addr >= current->mm->context.pmp_xlate_virt) {
+		unsigned long phys, offset;
+		unsigned long dv = current->mm->context.pmp_data_vaddr;
+
+		if (addr < dv)
+			offset = current->mm->context.pmp_text_offset;
+		else
+			offset = current->mm->context.pmp_data_offset;
+		phys = addr + offset;
+
+		/* Translated physical must land in RAM or flash */
+		if (phys >= CONFIG_PHYS_RAM_BASE &&
+		    phys <= (max_low_pfn << PAGE_SHIFT))
+			return 1;
+		if (phys >= 0x20000000UL && phys <= 0x22000000UL)
+			return 1;
+	}
+
 	return __access_ok_fault(addr, size);
 }
 #define __access_ok __access_ok

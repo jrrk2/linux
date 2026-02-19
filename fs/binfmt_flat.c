@@ -43,6 +43,9 @@
 #include <asm/cacheflush.h>
 #include <asm/page.h>
 #include <asm/flat.h>
+#ifdef CONFIG_RISCV_M_MODE
+#include <asm/mmu.h>
+#endif
 
 #ifndef flat_get_relocate_addr
 #define flat_get_relocate_addr(rel)	(rel)
@@ -587,6 +590,31 @@ static int load_flat_file(struct linux_binprm *bprm,
 			(datapos + (ntohl(hdr->reloc_start) - text_len));
 		memp = realdatastart;
 		memp_size = len;
+#ifdef CONFIG_RISCV_M_MODE
+		/*
+		 * PMP offset translation for XIP: present a contiguous
+		 * virtual address space to the binary while text runs
+		 * from flash and data from RAM.
+		 */
+		{
+			unsigned long virt_base = 0x00010000;
+			unsigned long textpos_phys = textpos;
+			unsigned long datapos_phys = datapos;
+
+			riscv_pmp_xlate_setup(virt_base,
+					      virt_base + text_len,
+					      virt_base + text_len + len,
+					      textpos_phys, datapos_phys);
+
+			textpos = virt_base;
+			datapos = virt_base + text_len;
+			memp = memp - datapos_phys + datapos;
+			reloc = (__be32 __user *)
+				(datapos + (ntohl(hdr->reloc_start) - text_len));
+
+			current->mm->context.pmp_xlate_virt = virt_base;
+		}
+#endif
 	} else {
 
 		len = text_len + data_len + extra +

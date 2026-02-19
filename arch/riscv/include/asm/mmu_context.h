@@ -8,7 +8,7 @@
 #define _ASM_RISCV_MMU_CONTEXT_H
 
 #include <linux/mm_types.h>
-#include <asm-generic/mm_hooks.h>
+#include <asm/mm_hooks.h>
 
 #include <linux/mm.h>
 #include <linux/sched.h>

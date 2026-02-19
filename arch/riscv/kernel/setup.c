@@ -311,6 +311,65 @@ static void __init riscv_spinlock_init(void)
 		pr_info("Queued spinlock %s: enabled\n", using_ext);
 }
 
+#ifdef CONFIG_RISCV_M_MODE
+/*
+ * PMP offset address translation for XIP binaries.
+ *
+ * Programs PMP entries 0-2 to create a virtual address space:
+ *   Entry 0: OFF, pmpaddr0 = text_vaddr >> 2 (TOR lower bound for entry 1)
+ *   Entry 1: TOR R+X, maps virtual text to flash via offset
+ *   Entry 2: TOR R+W+X, maps virtual data to RAM via offset
+ *
+ * These have higher priority than the catch-all on entry 6 (set in head.S).
+ */
+void riscv_pmp_xlate_setup(unsigned long text_vaddr, unsigned long data_vaddr,
+			   unsigned long data_end_vaddr,
+			   unsigned long textpos_phys, unsigned long datapos_phys)
+{
+	unsigned long cfg;
+
+	/* TOR boundaries */
+	csr_write(CSR_PMPADDR0 + 0, text_vaddr >> 2);
+	csr_write(CSR_PMPADDR0 + 1, data_vaddr >> 2);
+	csr_write(CSR_PMPADDR0 + 2, data_end_vaddr >> 2);
+
+	/* Translation offsets */
+	csr_write(CSR_PMPOFFSET0 + 1, textpos_phys - text_vaddr);
+	csr_write(CSR_PMPOFFSET0 + 2, datapos_phys - data_vaddr);
+
+	/* pmpcfg0: byte0=OFF, byte1=TOR|R|X, byte2=TOR|R|W|X, byte3=preserve */
+	cfg = csr_read(CSR_PMPCFG0);
+	cfg &= 0xff000000UL;
+	cfg |= (PMP_A_TOR | PMP_R | PMP_W | PMP_X) << 16;	/* entry 2 */
+	cfg |= (PMP_A_TOR | PMP_R | PMP_X) << 8;		/* entry 1 */
+	/* entry 0: byte0 = 0 (OFF) */
+	csr_write(CSR_PMPCFG0, cfg);
+
+	/* Store translation info in mm for access_ok validation */
+	current->mm->context.pmp_text_offset = textpos_phys - text_vaddr;
+	current->mm->context.pmp_data_offset = datapos_phys - data_vaddr;
+	current->mm->context.pmp_data_vaddr = data_vaddr;
+	current->mm->context.pmp_data_end = data_end_vaddr;
+
+	pr_info("PMP xlate: text %lx->%lx data %lx->%lx\n",
+		text_vaddr, textpos_phys, data_vaddr, datapos_phys);
+}
+
+void riscv_pmp_xlate_clear(void)
+{
+	unsigned long cfg;
+
+	/* Clear pmpcfg0 bytes 0-2 (entries 0-2), preserve byte 3 (entry 3) */
+	cfg = csr_read(CSR_PMPCFG0);
+	cfg &= 0xff000000UL;
+	csr_write(CSR_PMPCFG0, cfg);
+
+	/* Clear offsets */
+	csr_write(CSR_PMPOFFSET0 + 1, 0);
+	csr_write(CSR_PMPOFFSET0 + 2, 0);
+}
+#endif /* CONFIG_RISCV_M_MODE */
+
 extern void __init init_rt_signal_env(void);
 
 /* Expected .text checksum — patched into vmlinux by scripts/patch_text_checksum.py */
@@ -398,35 +457,32 @@ void __init setup_arch(char **cmdline_p)
 	apply_boot_alternatives();
 
 	/*
-	 * Protect kernel text with PMP: TOR entries 1-2, locked R+X.
-	 * Entry 7 = RWX NAPOT catch-all (not locked, but M-mode doesn't
-	 * need it — unmatched addresses are allowed in M-mode).
+	 * Protect kernel text with PMP, locked R+X.
 	 * Must be after apply_boot_alternatives() which patches .text.
 	 *
-	 * PMP entry 0 may be locked by the bootloader — skip it.
-	 * Entry 1: pmpaddr = _start >> 2 (TOR bottom, cfg=0)
-	 * Entry 2: pmpaddr = PAGE_ALIGN(_etext) >> 2, cfg = L|R|X|TOR
+	 * PMP entry layout (7 entries available, entry 7 disabled in HW):
+	 *   0-2: Reserved for XIP offset translation (binfmt_elf_pmp)
+	 *   3:   OFF, pmpaddr = _stext >> 2 (TOR bottom for entry 4)
+	 *   4:   TOR, locked R+X (kernel text protection)
+	 *   5:   NAPOT, locked no-access (stack guard, updated on switch)
+	 *   6:   NAPOT, RWX catch-all (set in head.S)
 	 */
 #ifdef CONFIG_RISCV_M_MODE
 	{
 		unsigned long etext_aligned = (unsigned long)_etext;
 		etext_aligned = (etext_aligned + PAGE_SIZE - 1) & PAGE_MASK;
 
-		/* Entry 7: RWX catch-all */
-		csr_write(0x3b7, -1UL);  /* pmpaddr7 */
-		csr_write(0x3a1, 0x1fUL << 24);  /* pmpcfg1 byte3 = RWX|NAPOT */
+		/* Entry 3: TOR bottom (cfg=OFF, just sets the address) */
+		csr_write(CSR_PMPADDR0 + 3, (unsigned long)_stext >> 2);
 
-		/* Entry 1: TOR bottom */
-		csr_write(0x3b1, (unsigned long)_stext >> 2);  /* pmpaddr1 */
+		/* Entry 4: TOR top, locked R+X */
+		csr_write(CSR_PMPADDR0 + 4, etext_aligned >> 2);
 
-		/* Entry 2: TOR top, locked R+X */
-		csr_write(0x3b2, etext_aligned >> 2);  /* pmpaddr2 */
-
-		/* Set pmpcfg0 byte 2 = L|R|X|TOR = 0x8D, preserve other bytes */
-		unsigned long cfg = csr_read(0x3a0);  /* pmpcfg0 */
-		cfg &= ~(0xffUL << 16);
-		cfg |= (0x8dUL << 16);  /* L|R|X|TOR */
-		csr_write(0x3a0, cfg);
+		/* pmpcfg1 byte 0 = L|R|X|TOR = 0x8D (entry 4), preserve rest */
+		unsigned long cfg = csr_read(CSR_PMPCFG0 + 1);
+		cfg &= ~0xffUL;
+		cfg |= 0x8dUL;  /* L|R|X|TOR */
+		csr_write(CSR_PMPCFG0 + 1, cfg);
 
 		pr_info("PMP: text protected [%px - %px] (locked R+X TOR)\n",
 			_stext, (void *)etext_aligned);
@@ -438,17 +494,17 @@ void __init setup_arch(char **cmdline_p)
 		csr_write(CSR_MSECCFG, MSECCFG_RLB);
 
 		/*
-		 * PMP entry 3: locked NAPOT no-access guard at bottom
+		 * PMP entry 5: locked NAPOT no-access guard at bottom
 		 * of current (idle) task stack.  128 bytes.
 		 */
 		{
 			unsigned long guard = (unsigned long)current->stack;
-			csr_write(CSR_PMPADDR0 + 3,
+			csr_write(CSR_PMPADDR0 + 5,
 				  (guard >> 2) | PMP_GUARD_NAPOT_MASK);
-			cfg = csr_read(CSR_PMPCFG0);
-			cfg &= ~(0xffUL << 24);
-			cfg |= ((unsigned long)PMP_GUARD_CFG << 24);
-			csr_write(CSR_PMPCFG0, cfg);
+			cfg = csr_read(CSR_PMPCFG0 + 1);
+			cfg &= ~(0xffUL << 8);
+			cfg |= ((unsigned long)PMP_GUARD_CFG << 8);
+			csr_write(CSR_PMPCFG0 + 1, cfg);
 			pr_info("PMP: stack guard [%px - %px] (ePMP RLB)\n",
 				(void *)guard,
 				(void *)(guard + PMP_GUARD_SIZE));

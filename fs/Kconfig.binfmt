@@ -69,6 +69,14 @@ config BINFMT_ELF_FDPIC
 
 	  It is also possible to run FDPIC ELF binaries on MMU linux also.
 
+config BINFMT_ELF_PMP
+	bool "Static ELF binaries via PMP address translation"
+	depends on RISCV && !MMU && RISCV_M_MODE
+	help
+	  Load regular static ELF binaries on nommu RISC-V using PMP offset
+	  address translation. Text executes XIP from flash, data is copied
+	  to RAM. Requires the PMP address offset hardware extension.
+
 config ELFCORE
 	bool
 	help

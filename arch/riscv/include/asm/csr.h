@@ -422,6 +422,7 @@
 #define CSR_MIP			0x344
 #define CSR_PMPCFG0		0x3a0
 #define CSR_PMPADDR0		0x3b0
+#define CSR_PMPOFFSET0		0x7d0
 #define CSR_MSECCFG		0x747
 #define CSR_MSECCFGH		0x757
 #define CSR_MVENDORID		0xf11
