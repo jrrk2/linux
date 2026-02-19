@@ -1,4 +1,3 @@
 #!/bin/sh
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-exec /bin/sh -l
+mount -t romfs mtd:flash /mnt
+exec switch_root /mnt /sbin/init

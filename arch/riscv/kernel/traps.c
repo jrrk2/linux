@@ -167,6 +167,10 @@ static void do_trap_error(struct pt_regs *regs, int signo, int code,
 {
 	current->thread.bad_cause = regs->cause;
 
+	pr_info("TRAP: %s mode=%s epc=%08lx badaddr=%08lx ra=%08lx sp=%08lx\n",
+		str, user_mode(regs) ? "user" : "kernel",
+		regs->epc, regs->badaddr, regs->ra, regs->sp);
+
 	if (user_mode(regs)) {
 		do_trap(regs, signo, code, addr);
 	} else {

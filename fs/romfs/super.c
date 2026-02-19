@@ -594,7 +594,9 @@ static struct file_system_type romfs_fs_type = {
 	.name		= "romfs",
 	.init_fs_context = romfs_init_fs_context,
 	.kill_sb	= romfs_kill_sb,
+#ifdef CONFIG_ROMFS_ON_BLOCK
 	.fs_flags	= FS_REQUIRES_DEV,
+#endif
 };
 MODULE_ALIAS_FS("romfs");
 

@@ -498,10 +498,11 @@ static void account_kernel_stack(struct task_struct *tsk, int account)
 	} else {
 		void *stack = task_stack_page(tsk);
 
+#if !defined(CONFIG_VMAP_STACK) && THREAD_SIZE >= PAGE_SIZE
 		/* SRAM stacks aren't in the page allocator — skip accounting */
 		if (is_sram_stack(stack))
 			return;
-
+#endif
 		/* All stack pages are in the same node. */
 		mod_lruvec_kmem_state(stack, NR_KERNEL_STACK_KB,
 				      account * (THREAD_SIZE / 1024));

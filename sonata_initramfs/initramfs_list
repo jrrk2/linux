@@ -7,6 +7,7 @@ dir /etc/init.d 0755 0 0
 dir /proc 0755 0 0
 dir /sys 0755 0 0
 dir /tmp 1777 0 0
+dir /mnt 0755 0 0
 
 # Device nodes
 nod /dev/console 0600 0 0 c 5 1
@@ -16,7 +17,9 @@ nod /dev/fb0 0666 0 0 c 29 0
 # Busybox binary
 file /bin/busybox /home/jonathan/busybox-1.36.1/busybox 0755 0 0
 
-# No /init, /sbin/init, /etc/init, /bin/init — kernel falls through to /bin/sh
+# Init: mount romfs from flash and switch_root
+file /init sonata_initramfs/init.sh 0755 0 0
+slink /sbin/switch_root /bin/busybox 0755 0 0
 
 # Shell
 slink /bin/sh /bin/busybox 0755 0 0
