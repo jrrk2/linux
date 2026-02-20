@@ -1515,6 +1515,8 @@ void exit_mmap(struct mm_struct *mm)
 
 	mm->total_vm = 0;
 
+	arch_exit_mmap(mm);
+
 	/*
 	 * Lock the mm to avoid assert complaining even though this is the only
 	 * user of the mm
