@@ -270,6 +270,11 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 #endif
 	bnez s0, 1f
 
+#ifdef CONFIG_RISCV_M_MODE
+	mv	a0, sp
+	call	riscv_pmp_xlate_switch
+#endif
+
 #ifdef CONFIG_KSTACK_ERASE
 	call	stackleak_erase_on_task_stack
 #endif
@@ -479,6 +484,26 @@ SYM_FUNC_START(__switch_to)
 	REG_L s11, TASK_THREAD_S11_RA(a4)
 	/* The offset of thread_info in task_struct is zero. */
 	move tp, a1
+
+#ifdef CONFIG_RISCV_M_MODE
+	/*
+	 * Switch PMP address translation to match next task's mm.
+	 * Must happen during context switch so signal delivery
+	 * (via copy_to_user) uses the correct PMP offsets.
+	 * Save a0/a1 across the call (schedule_tail needs them).
+	 */
+	addi	sp, sp, -16
+	REG_S	ra, 0(sp)
+	REG_S	a0, 4(sp)
+	REG_S	a1, 8(sp)
+	move	a0, a1
+	call	riscv_pmp_switch_task
+	REG_L	ra, 0(sp)
+	REG_L	a0, 4(sp)
+	REG_L	a1, 8(sp)
+	addi	sp, sp, 16
+#endif
+
 	/* Switch to the next shadow call stack */
 	scs_load_current
 	ret

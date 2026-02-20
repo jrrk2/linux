@@ -17,6 +17,8 @@ typedef struct {
 	unsigned long	pmp_data_offset;/* phys = virt + offset (data/RAM region) */
 	unsigned long	pmp_data_vaddr;	/* boundary between text and data regions */
 	unsigned long	pmp_data_end;	/* end of data region (virtual) */
+	unsigned long	pmp_data_phys;	/* nonzero = fork'd data alloc (needs freeing) */
+	unsigned int	pmp_data_alloc_order; /* page order of above allocation */
 #else
 	atomic_long_t id;
 #endif
@@ -51,6 +53,9 @@ void riscv_pmp_xlate_setup(unsigned long text_vaddr, unsigned long data_vaddr,
 			   unsigned long data_end_vaddr,
 			   unsigned long textpos_phys, unsigned long datapos_phys);
 void riscv_pmp_xlate_clear(void);
+int riscv_pmp_fork_data(struct mm_struct *child_mm, struct mm_struct *parent_mm);
+struct pt_regs;
+void riscv_pmp_xlate_switch(struct pt_regs *regs);
 #endif
 
 #endif /* __ASSEMBLER__ */

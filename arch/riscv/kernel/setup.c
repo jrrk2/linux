@@ -32,6 +32,7 @@
 #include <asm/pgtable.h>
 #include <asm/setup.h>
 #include <asm/set_memory.h>
+#include <asm/ptrace.h>
 #include <asm/sections.h>
 #include <asm/sbi.h>
 #include <asm/tlbflush.h>
@@ -367,6 +368,109 @@ void riscv_pmp_xlate_clear(void)
 	/* Clear offsets */
 	csr_write(CSR_PMPOFFSET0 + 1, 0);
 	csr_write(CSR_PMPOFFSET0 + 2, 0);
+}
+
+/*
+ * Fork data+stack for PMP xlate process.
+ * Allocates new physical RAM for the child's data region and copies
+ * the parent's data+stack contents. Both share text XIP from flash.
+ */
+int riscv_pmp_fork_data(struct mm_struct *child_mm, struct mm_struct *parent_mm)
+{
+	unsigned long size, parent_phys, child_phys;
+	int order;
+	struct page *pages;
+
+	size = parent_mm->context.pmp_data_end - parent_mm->context.pmp_data_vaddr;
+	parent_phys = parent_mm->context.pmp_data_vaddr +
+		      parent_mm->context.pmp_data_offset;
+
+	order = get_order(size);
+	pages = alloc_pages(GFP_KERNEL, order);
+	if (!pages)
+		return -ENOMEM;
+
+	child_phys = (unsigned long)page_address(pages);
+	memcpy((void *)child_phys, (void *)parent_phys, size);
+
+	child_mm->context.pmp_data_offset = child_phys -
+					    child_mm->context.pmp_data_vaddr;
+	child_mm->context.pmp_data_phys = child_phys;
+	child_mm->context.pmp_data_alloc_order = order;
+
+	pr_info("PMP fork: pid=%d parent_data=%lx child_data=%lx size=%lx\n",
+		current->pid, parent_phys, child_phys, size);
+
+	return 0;
+}
+
+/*
+ * Restore PMP address translation for the current process.
+ * Called from ret_from_exception when returning to user mode,
+ * to ensure PMP entries match the current mm after context switch.
+ */
+void riscv_pmp_xlate_switch(struct pt_regs *regs)
+{
+	struct mm_struct *mm = current->mm;
+	unsigned long cfg;
+	static unsigned long last_data_offset;
+
+	if (!mm || !mm->context.pmp_xlate_virt)
+		return;
+
+	if (mm->context.pmp_data_offset != last_data_offset) {
+		pr_info("PMP switch: pid=%d data_off=%lx->%lx epc=%lx ra=%lx sp=%lx\n",
+			current->pid, last_data_offset,
+			mm->context.pmp_data_offset,
+			regs->epc, regs->ra, regs->sp);
+		last_data_offset = mm->context.pmp_data_offset;
+	}
+
+	csr_write(CSR_PMPADDR0 + 0, mm->context.pmp_xlate_virt >> 2);
+	csr_write(CSR_PMPADDR0 + 1, mm->context.pmp_data_vaddr >> 2);
+	csr_write(CSR_PMPADDR0 + 2, mm->context.pmp_data_end >> 2);
+
+	csr_write(CSR_PMPOFFSET0 + 1, mm->context.pmp_text_offset);
+	csr_write(CSR_PMPOFFSET0 + 2, mm->context.pmp_data_offset);
+
+	cfg = csr_read(CSR_PMPCFG0);
+	cfg &= 0xff000000UL;
+	cfg |= (PMP_A_TOR | PMP_R | PMP_W | PMP_X) << 16;
+	cfg |= (PMP_A_TOR | PMP_R | PMP_X) << 8;
+	csr_write(CSR_PMPCFG0, cfg);
+
+	/* I-cache may have stale entries from old PMP translation */
+	asm volatile ("fence.i" ::: "memory");
+}
+
+/*
+ * Switch PMP address translation to match a task's mm.
+ * Called from __switch_to in entry.S during context switch,
+ * so that kernel code running after switch (e.g. signal delivery)
+ * accesses the correct physical memory via PMP offsets.
+ */
+void riscv_pmp_switch_task(struct task_struct *next)
+{
+	struct mm_struct *mm = next->mm;
+	unsigned long cfg;
+
+	if (!mm || !mm->context.pmp_xlate_virt)
+		return;
+
+	csr_write(CSR_PMPADDR0 + 0, mm->context.pmp_xlate_virt >> 2);
+	csr_write(CSR_PMPADDR0 + 1, mm->context.pmp_data_vaddr >> 2);
+	csr_write(CSR_PMPADDR0 + 2, mm->context.pmp_data_end >> 2);
+
+	csr_write(CSR_PMPOFFSET0 + 1, mm->context.pmp_text_offset);
+	csr_write(CSR_PMPOFFSET0 + 2, mm->context.pmp_data_offset);
+
+	cfg = csr_read(CSR_PMPCFG0);
+	cfg &= 0xff000000UL;
+	cfg |= (PMP_A_TOR | PMP_R | PMP_W | PMP_X) << 16;
+	cfg |= (PMP_A_TOR | PMP_R | PMP_X) << 8;
+	csr_write(CSR_PMPCFG0, cfg);
+
+	asm volatile ("fence.i" ::: "memory");
 }
 #endif /* CONFIG_RISCV_M_MODE */
 

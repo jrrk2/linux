@@ -15,6 +15,12 @@ static inline void arch_exit_mmap(struct mm_struct *mm)
 #if defined(CONFIG_RISCV_M_MODE) && !defined(CONFIG_MMU)
 	if (mm->context.pmp_xlate_virt)
 		riscv_pmp_xlate_clear();
+	/* Free data allocation from riscv_pmp_fork_data() */
+	if (mm->context.pmp_data_phys) {
+		free_pages(mm->context.pmp_data_phys,
+			   mm->context.pmp_data_alloc_order);
+		mm->context.pmp_data_phys = 0;
+	}
 #endif
 }
 

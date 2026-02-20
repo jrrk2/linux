@@ -1592,8 +1592,29 @@ static int copy_mm(u64 clone_flags, struct task_struct *tsk)
 		return 0;
 
 	if (clone_flags & CLONE_VM) {
-		mmget(oldmm);
-		mm = oldmm;
+#if defined(CONFIG_RISCV_M_MODE) && !defined(CONFIG_MMU)
+		if (oldmm->context.pmp_xlate_virt) {
+			int ret;
+
+			/*
+			 * PMP address translation active: give the child its
+			 * own mm with a private copy of data+stack instead of
+			 * sharing.  Text stays shared (XIP from flash).
+			 */
+			mm = dup_mm(tsk, oldmm);
+			if (!mm)
+				return -ENOMEM;
+			ret = riscv_pmp_fork_data(mm, oldmm);
+			if (ret) {
+				mmput(mm);
+				return ret;
+			}
+		} else
+#endif
+		{
+			mmget(oldmm);
+			mm = oldmm;
+		}
 	} else {
 		mm = dup_mm(tsk, current->mm);
 		if (!mm)

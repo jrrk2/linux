@@ -123,6 +123,7 @@ static inline void __switch_to_pmp_guard(struct task_struct *next)
 
 	csr_write(CSR_PMPADDR0 + 5, (guard >> 2) | PMP_GUARD_NAPOT_MASK);
 }
+
 #else
 #define __switch_to_pmp_guard(next) do { } while (0)
 #endif
