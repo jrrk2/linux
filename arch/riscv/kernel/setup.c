@@ -352,7 +352,7 @@ void riscv_pmp_xlate_setup(unsigned long text_vaddr, unsigned long data_vaddr,
 	current->mm->context.pmp_data_vaddr = data_vaddr;
 	current->mm->context.pmp_data_end = data_end_vaddr;
 
-	pr_info("PMP xlate: text %lx->%lx data %lx->%lx\n",
+	if (0) pr_info("PMP xlate: text %lx->%lx data %lx->%lx\n",
 		text_vaddr, textpos_phys, data_vaddr, datapos_phys);
 }
 
@@ -398,7 +398,7 @@ int riscv_pmp_fork_data(struct mm_struct *child_mm, struct mm_struct *parent_mm)
 	child_mm->context.pmp_data_phys = child_phys;
 	child_mm->context.pmp_data_alloc_order = order;
 
-	pr_info("PMP fork: pid=%d parent_data=%lx child_data=%lx size=%lx\n",
+	if (0) pr_info("PMP fork: pid=%d parent_data=%lx child_data=%lx size=%lx\n",
 		current->pid, parent_phys, child_phys, size);
 
 	return 0;
@@ -419,7 +419,7 @@ void riscv_pmp_xlate_switch(struct pt_regs *regs)
 		return;
 
 	if (mm->context.pmp_data_offset != last_data_offset) {
-		pr_info("PMP switch: pid=%d data_off=%lx->%lx epc=%lx ra=%lx sp=%lx\n",
+		if (0) pr_info("PMP switch: pid=%d data_off=%lx->%lx epc=%lx ra=%lx sp=%lx\n",
 			current->pid, last_data_offset,
 			mm->context.pmp_data_offset,
 			regs->epc, regs->ra, regs->sp);

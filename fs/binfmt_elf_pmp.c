@@ -389,7 +389,7 @@ static int load_elf_pmp_binary(struct linux_binprm *bprm)
 	regs = current_pt_regs();
 	finalize_exec(bprm);
 
-	pr_info("%s: TEXT=%lx-%lx DATA=%lx-%lx BSS=%lx BRK=%lx STACK=%lx\n",
+	if (0) pr_info("%s: TEXT=%lx-%lx DATA=%lx-%lx BSS=%lx BRK=%lx STACK=%lx\n",
 		bprm->filename,
 		mm->start_code, mm->end_code,
 		mm->start_data, mm->end_data,
