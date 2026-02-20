@@ -134,7 +134,6 @@
 			reg = <0x80500000 0x2000>;
 			interrupts = <5>;
 			clocks = <&sysclk>;
-			status = "disabled";
 		};
 
 		gpio0: gpio@80000000 {
