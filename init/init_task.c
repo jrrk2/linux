@@ -16,6 +16,7 @@
 #include <linux/plist.h>
 
 #include <linux/uaccess.h>
+#include <asm/sonata.h>
 
 static struct signal_struct init_signals = {
 	.nr_threads	= 1,
@@ -72,7 +73,7 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
 	.stack_refcount	= REFCOUNT_INIT(1),
 #endif
 	.__state	= 0,
-	.stack		= (void *)(0x00120000UL - THREAD_SIZE), /* Sonata: SRAM idle stack */
+	.stack		= (void *)(SONATA_SRAM_END - THREAD_SIZE), /* Sonata: early SRAM stack */
 	.usage		= REFCOUNT_INIT(2),
 	.flags		= PF_KTHREAD,
 	.prio		= MAX_PRIO - 20,

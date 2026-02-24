@@ -110,6 +110,11 @@
 #include <asm/setup.h>
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
+#if defined(CONFIG_RISCV)
+#include <asm/sonata.h>
+asmlinkage void riscv_sonata_do_stack_switch(unsigned long new_sp,
+					     unsigned long new_base);
+#endif
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/initcall.h>
@@ -1034,6 +1039,21 @@ void start_kernel(void)
 	profile_init();
 	call_function_init();
 	WARN(!irqs_disabled(), "Interrupts were enabled early\n");
+
+#if defined(CONFIG_RISCV)
+	{
+		unsigned long new_base = riscv_sonata_prepare_stack_switch();
+
+		pr_notice("Sonata: stack switch callsite reached, new_base=%px\n",
+			  (void *)new_base);
+		if (new_base) {
+			riscv_sonata_do_stack_switch(SONATA_HYPERRAM_END,
+						     new_base);
+			riscv_sonata_stack_switch_finish(new_base);
+			pr_notice("Sonata: stack switch callsite done\n");
+		}
+	}
+#endif
 
 	early_boot_irqs_disabled = false;
 	local_irq_enable();

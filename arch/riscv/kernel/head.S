@@ -563,3 +563,9 @@ SYM_CODE_START_LOCAL(reset_regs)
 	ret
 SYM_CODE_END(reset_regs)
 #endif /* CONFIG_RISCV_M_MODE */
+
+/* Switch to a new stack and return to caller. */
+SYM_CODE_START(riscv_sonata_do_stack_switch)
+	mv sp, a0
+	ret
+SYM_CODE_END(riscv_sonata_do_stack_switch)

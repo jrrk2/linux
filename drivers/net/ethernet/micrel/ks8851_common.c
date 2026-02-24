@@ -234,7 +234,7 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 
 	rxfc = (ks8851_rdreg16(ks, KS_RXFCTR) >> 8) & 0xff;
 
-	dev_info(&ks->netdev->dev, "rx_pkts: rxfc=%d\n", rxfc);
+	dev_dbg(&ks->netdev->dev, "rx_pkts: rxfc=%d\n", rxfc);
 
 	netif_dbg(ks, rx_status, ks->netdev,
 		  "%s: %d packets\n", __func__, rxfc);
@@ -253,7 +253,7 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 		rxstat = ks8851_rdreg16(ks, KS_RXFHSR);
 		rxlen = ks8851_rdreg16(ks, KS_RXFHBCR) & RXFHBCR_CNT_MASK;
 
-		dev_info(&ks->netdev->dev, "rx: stat=0x%04x len=%d\n", rxstat, rxlen);
+		dev_dbg(&ks->netdev->dev, "rx: stat=0x%04x len=%d\n", rxstat, rxlen);
 
 		netif_dbg(ks, rx_status, ks->netdev,
 			  "rx: stat 0x%04x, len 0x%04x\n", rxstat, rxlen);
@@ -296,7 +296,7 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 				netif_dbg(ks, pktdata, ks->netdev,
 					  "pkt %12ph\n", &rxpkt[4]);
 
-				dev_info(&ks->netdev->dev,
+				dev_dbg(&ks->netdev->dev,
 					 "rx pkt: %14ph\n", rxpkt + 8);
 
 				skb->protocol = eth_type_trans(skb, ks->netdev);
@@ -341,7 +341,7 @@ static void ks8851_irq_work(struct work_struct *work)
 	ks8851_wrreg16(ks, KS_IER, 0x0000);
 
 	status = ks8851_rdreg16(ks, KS_ISR);
-	dev_info(&ks->netdev->dev, "irq_work: ISR=0x%04x rc_ier=0x%04x RXCR1=0x%04x RXFCTR=0x%04x\n",
+	dev_dbg(&ks->netdev->dev, "irq_work: ISR=0x%04x rc_ier=0x%04x RXCR1=0x%04x RXFCTR=0x%04x\n",
 		 status, ks->rc_ier,
 		 ks8851_rdreg16(ks, KS_RXCR1),
 		 ks8851_rdreg16(ks, KS_RXFCTR));
@@ -396,10 +396,10 @@ static void ks8851_irq_work(struct work_struct *work)
 
 	if (link_changed) {
 		if (link_up && !netif_carrier_ok(ks->netdev)) {
-			netdev_info(ks->netdev, "link up\n");
+			netdev_dbg(ks->netdev, "link up\n");
 			netif_carrier_on(ks->netdev);
 		} else if (!link_up && netif_carrier_ok(ks->netdev)) {
-			netdev_info(ks->netdev, "link down\n");
+			netdev_dbg(ks->netdev, "link down\n");
 			netif_carrier_off(ks->netdev);
 		}
 	}
@@ -647,7 +647,7 @@ static int ks8851_net_open(struct net_device *dev)
 			u16 isr_rb = ks8851_rdreg16(ks, KS_ISR);
 			u16 rxcr1 = ks8851_rdreg16(ks, KS_RXCR1);
 			u16 txcr = ks8851_rdreg16(ks, KS_TXCR);
-			netdev_info(dev, "open: IER=0x%04x ISR=0x%04x RXCR1=0x%04x TXCR=0x%04x rc_ier=0x%04x\n",
+			netdev_dbg(dev, "open: IER=0x%04x ISR=0x%04x RXCR1=0x%04x TXCR=0x%04x rc_ier=0x%04x\n",
 				    ier_rb, isr_rb, rxcr1, txcr, ks->rc_ier);
 		}
 		ks8851_unlock(ks, &flags);
@@ -657,10 +657,10 @@ static int ks8851_net_open(struct net_device *dev)
 	if (ks->use_poll) {
 		netif_carrier_on(ks->netdev);
 		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(5));
-		netdev_info(dev, "using polled mode (5ms interval)\n");
+		netdev_dbg(dev, "using polled mode (5ms interval)\n");
 	} else {
 		mii_check_link(&ks->mii);
-		netdev_info(dev, "using interrupt mode (IRQ %d)\n", dev->irq);
+		netdev_dbg(dev, "using interrupt mode (IRQ %d)\n", dev->irq);
 	}
 
 	return 0;
@@ -1347,7 +1347,7 @@ int ks8851_probe_common(struct net_device *netdev, struct device *dev,
 	ks->mii.mdio_read	= ks8851_phy_read;
 	ks->mii.mdio_write	= ks8851_phy_write;
 
-	dev_info(dev, "message enable is %d\n", msg_en);
+	dev_dbg(dev, "message enable is %d\n", msg_en);
 
 	ret = ks8851_register_mdiobus(ks, dev);
 	if (ret)
@@ -1391,7 +1391,7 @@ int ks8851_probe_common(struct net_device *netdev, struct device *dev,
 		goto err_id;
 	}
 
-	netdev_info(netdev, "revision %d, MAC %pM, IRQ %d, %s EEPROM\n",
+	netdev_dbg(netdev, "revision %d, MAC %pM, IRQ %d, %s EEPROM\n",
 		    CIDER_REV_GET(cider), netdev->dev_addr, netdev->irq,
 		    ks->rc_ccr & CCR_EEPROM ? "has" : "no");
 
@@ -1417,7 +1417,7 @@ void ks8851_remove_common(struct device *dev)
 	ks8851_unregister_mdiobus(priv);
 
 	if (netif_msg_drv(priv))
-		dev_info(dev, "remove\n");
+		dev_dbg(dev, "remove\n");
 
 	unregister_netdev(priv->netdev);
 	if (priv->gpio)

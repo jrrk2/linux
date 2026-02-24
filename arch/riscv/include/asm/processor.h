@@ -133,11 +133,10 @@ static inline void arch_thread_struct_whitelist(unsigned long *offset,
 }
 
 /*
- * Sonata: idle task stack lives in SRAM at 0x0011e000–0x00120000
- * (top 8KB of 128KB SRAM), matching the sp set in head.S.
+ * Sonata: early boot stack lives at the top of SRAM, matching head.S.
  */
 #define INIT_THREAD {					\
-	.sp = 0x00120000UL,				\
+	.sp = SONATA_SRAM_END,				\
 	.align_ctl = PR_UNALIGN_NOPRINT,		\
 }
 

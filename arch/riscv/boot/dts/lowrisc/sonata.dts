@@ -47,6 +47,18 @@
 		reg = <0x40000000 0x00800000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* Reserve top 4KB of HyperRAM for idle task stack */
+		idle_stack@407ff000 {
+			reg = <0x407ff000 0x00001000>;
+			no-map;
+		};
+	};
+
 	soc {
 		#address-cells = <1>;
 		#size-cells = <1>;

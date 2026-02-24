@@ -57,5 +57,7 @@ asmlinkage void ret_from_fork_user(struct pt_regs *regs);
 asmlinkage void handle_bad_stack(struct pt_regs *regs);
 asmlinkage void do_page_fault(struct pt_regs *regs);
 asmlinkage void do_irq(struct pt_regs *regs);
+asmlinkage void riscv_sonata_do_stack_switch(unsigned long new_sp,
+					     unsigned long new_base);
 
 #endif /* _ASM_RISCV_PROTOTYPES_H */

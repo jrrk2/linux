@@ -324,7 +324,7 @@ static void ks8851_tx_work(struct work_struct *work)
 		last = skb_queue_empty(&ks->txq);
 
 		if (txb) {
-			dev_info(&ks->netdev->dev, "tx: len=%d %14ph\n",
+			dev_dbg(&ks->netdev->dev, "tx: len=%d %14ph\n",
 				 txb->len, txb->data);
 			dequeued_len += calc_txlen(txb->len);
 

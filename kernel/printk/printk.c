@@ -514,14 +514,10 @@ static struct latched_seq clear_seq = {
 
 /*
  * On Sonata (nommu, M-mode, HyperRAM), place the printk ring buffer
- * and all its data structures in SRAM to avoid potential HyperRAM
- * caching/coherency issues with the lock-free ring buffer operations.
- *
- * The .sram.data section is placed at 0x00100000 by the linker script.
- * head.S skips this region when zeroing SRAM for the kernel stack.
+ * and all its data structures in main RAM (HyperRAM), not SRAM.
  */
 #if defined(CONFIG_RISCV_M_MODE) && !defined(CONFIG_MMU)
-#define __printk_sram __section(".sram.data")
+#define __printk_sram
 #else
 #define __printk_sram
 #endif

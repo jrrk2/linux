@@ -16,6 +16,7 @@
 #include <linux/sched.h>
 #include <linux/console.h>
 #include <linux/of_fdt.h>
+#include <linux/of.h>
 #include <linux/sched/task.h>
 #include <linux/smp.h>
 #include <linux/efi.h>
@@ -35,10 +36,12 @@
 #include <asm/ptrace.h>
 #include <asm/sections.h>
 #include <asm/sbi.h>
+#include <asm/switch_to.h>
 #include <asm/tlbflush.h>
 #include <asm/thread_info.h>
 #include <asm/kasan.h>
 #include <asm/efi.h>
+#include <asm/sonata.h>
 
 #include "head.h"
 
@@ -475,6 +478,40 @@ void riscv_pmp_switch_task(struct task_struct *next)
 #endif /* CONFIG_RISCV_M_MODE */
 
 extern void __init init_rt_signal_env(void);
+
+#ifndef CONFIG_MMU
+asmlinkage void riscv_sonata_do_stack_switch(unsigned long new_sp,
+					     unsigned long new_base);
+
+void __visible __used riscv_sonata_stack_switch_finish(unsigned long new_base)
+{
+	current->stack = (void *)new_base;
+	set_task_stack_end_magic(current);
+#ifdef CONFIG_RISCV_M_MODE
+	__switch_to_pmp_guard(current);
+#endif
+	pr_info("Sonata: switched kernel stack to HyperRAM [%px - %px]\n",
+		(void *)new_base,
+		(void *)(new_base + THREAD_SIZE));
+}
+EXPORT_SYMBOL_GPL(riscv_sonata_stack_switch_finish);
+
+static void (*__initdata __used sonata_stack_switch_finish_ptr)
+	(unsigned long) = riscv_sonata_stack_switch_finish;
+
+unsigned long __init riscv_sonata_prepare_stack_switch(void)
+{
+	if (!of_machine_is_compatible("lowrisc,sonata"))
+		return 0;
+
+	memset((void *)SONATA_HYPERRAM_STACK_BASE, 0, THREAD_SIZE);
+	pr_info("Sonata: preparing stack switch to HyperRAM\n");
+	return SONATA_HYPERRAM_STACK_BASE;
+}
+#else
+unsigned long __init riscv_sonata_prepare_stack_switch(void) { return 0; }
+void riscv_sonata_stack_switch_finish(unsigned long new_base) { }
+#endif
 
 /* Expected .text checksum — patched into vmlinux by scripts/patch_text_checksum.py */
 u32 expected_text_checksum __section(".data") = 0;
