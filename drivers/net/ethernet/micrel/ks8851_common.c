@@ -92,9 +92,9 @@ static unsigned int ks8851_rdreg16(struct ks8851_net *ks,
 static void ks8851_soft_reset(struct ks8851_net *ks, unsigned op)
 {
 	ks8851_wrreg16(ks, KS_GRR, op);
-	mdelay(1);	/* wait a short time to effect reset */
+	mdelay(10);	/* datasheet: 10ms minimum reset hold */
 	ks8851_wrreg16(ks, KS_GRR, 0);
-	mdelay(1);	/* wait for condition to clear */
+	mdelay(10);	/* datasheet: 10ms recovery before register access */
 }
 
 /**
@@ -240,6 +240,19 @@ static void ks8851_dbg_dumpkkt(struct ks8851_net *ks, u8 *rxpkt)
  * are packets in the receive queue. Find out how many packets there are and
  * read them from the FIFO.
  */
+/**
+ * ks8851_rx_pkts - receive packets from the KSZ8851 RX FIFO
+ *
+ * Modeled on the bare-metal eth_minimal_litex.c RX path:
+ *  1. Read frame count from RXFCTR
+ *  2. For each frame: read status (RXFHSR) and length (RXFHBCR)
+ *  3. If invalid: release frame via RRXEF without DMA
+ *  4. If valid: set RXFDPR, start DMA, read FIFO, end DMA+release
+ */
+static unsigned int rx_delay = 100;
+module_param(rx_delay, uint, 0644);
+MODULE_PARM_DESC(rx_delay, "Delay in microseconds before reading each RX frame header (default 100)");
+
 static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 {
 	struct sk_buff *skb;
@@ -253,53 +266,82 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 	netif_dbg(ks, rx_status, ks->netdev,
 		  "%s: %d packets\n", __func__, rxfc);
 
-	/* Currently we're issuing a read per packet, but we could possibly
-	 * improve the code by issuing a single read, getting the receive
-	 * header, allocating the packet and then reading the packet data
-	 * out in one go.
-	 *
-	 * This form of operation would require us to hold the SPI bus'
-	 * chipselect low during the entie transaction to avoid any
-	 * reset to the data stream coming from the chip.
-	 */
-
 	for (; rxfc != 0; rxfc--) {
+		if (rx_delay)
+			udelay(rx_delay);
+
 		rxstat = ks8851_rdreg16(ks, KS_RXFHSR);
 		rxlen = ks8851_rdreg16(ks, KS_RXFHBCR) & RXFHBCR_CNT_MASK;
 
 		netif_dbg(ks, rx_status, ks->netdev,
 			  "rx: stat 0x%04x, len 0x%04x\n", rxstat, rxlen);
 
-		/* the length of the packet includes the 32bit CRC */
+		/* Validate frame (matching bare-metal checks) */
+		if (!(rxstat & RXFSHR_RXFV) ||
+		    (rxstat & (RXFSHR_RXCE | RXFSHR_RXRF |
+			       RXFSHR_RXFTL | RXFSHR_RXMR)) ||
+		    rxlen <= 4 || rxlen > 1536) {
+			/* Diagnostic dump on drop */
+			{
+				u8 dumpbuf[48];
+				unsigned dumplen = (rxlen > 40) ? 40 : rxlen;
 
-		/* set dma read address */
-		ks8851_wrreg16(ks, KS_RXFDPR, RXFDPR_RXFPAI | 0x00);
+				pr_err("ks8851: DROP rxstat=0x%04x rxlen=%u rxfc=%u\n",
+				       rxstat, rxlen, rxfc);
+				pr_err("  RXCR1=0x%04x RXCR2=0x%04x TXCR=0x%04x\n",
+				       ks8851_rdreg16(ks, KS_RXCR1),
+				       ks8851_rdreg16(ks, KS_RXCR2),
+				       ks8851_rdreg16(ks, KS_TXCR));
+				pr_err("  RXQCR=0x%04x ISR=0x%04x IER=0x%04x P1SR=0x%04x\n",
+				       ks8851_rdreg16(ks, KS_RXQCR),
+				       ks8851_rdreg16(ks, KS_ISR),
+				       ks8851_rdreg16(ks, KS_IER),
+				       ks8851_rdreg16(ks, KS_P1SR));
 
-		/* start DMA access */
+				if (dumplen > 0 && rxlen <= 1536) {
+					/* DMA read to get packet data */
+					ks8851_wrreg16(ks, KS_RXFDPR, RXFDPR_RXFPAI);
+					ks8851_wrreg16(ks, KS_RXQCR,
+						       ks->rc_rxqcr | RXQCR_SDA);
+					memset(dumpbuf, 0, sizeof(dumpbuf));
+					ks->rdfifo(ks, dumpbuf, ALIGN(dumplen + 8, 4));
+					/* End DMA */
+					ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
+					print_hex_dump(KERN_ERR, "  pkt: ",
+						       DUMP_PREFIX_OFFSET, 16, 1,
+						       dumpbuf, dumplen + 8, false);
+				}
+			}
+			/* Release invalid frame */
+			ks8851_wrreg16(ks, KS_RXQCR,
+				       ks->rc_rxqcr | RXQCR_RRXEF);
+			ks->netdev->stats.rx_dropped++;
+			continue;
+		}
+
+		/* Strip 4-byte CRC */
+		rxlen -= 4;
+
+		/* Set DMA read address with auto-increment */
+		ks8851_wrreg16(ks, KS_RXFDPR, RXFDPR_RXFPAI);
+
+		/* Start DMA access */
 		ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr | RXQCR_SDA);
 
-		if (rxlen > 4) {
-			unsigned int rxalign;
+		{
+			unsigned int rxalign = ALIGN(rxlen, 4);
 
-			rxlen -= 4;
-			rxalign = ALIGN(rxlen, 4);
 			skb = netdev_alloc_skb_ip_align(ks->netdev, rxalign);
 			if (skb) {
-
-				/* 4 bytes of status header + 4 bytes of
-				 * garbage: we put them before ethernet
-				 * header, so that they are copied,
-				 * but ignored.
-				 */
-
+				/* FIFO outputs 8 bytes of header/dummy before
+				 * actual frame data.  Place them before the
+				 * skb data area where they'll be ignored. */
 				rxpkt = skb_put(skb, rxlen) - 8;
 
 				ks->rdfifo(ks, rxpkt, rxalign + 8);
 
-				if (netif_msg_pktdata(ks))
-					ks8851_dbg_dumpkkt(ks, rxpkt);
-
-				skb->protocol = eth_type_trans(skb, ks->netdev);
+				skb->protocol = eth_type_trans(skb,
+							       ks->netdev);
 				__skb_queue_tail(rxq, skb);
 
 				ks->netdev->stats.rx_packets++;
@@ -307,52 +349,77 @@ static void ks8851_rx_pkts(struct ks8851_net *ks, struct sk_buff_head *rxq)
 			}
 		}
 
-		/* end DMA access and dequeue packet */
+		/* End DMA access and release frame */
 		ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr | RXQCR_RRXEF);
 	}
 }
 
 /**
- * ks8851_irq - IRQ handler for dealing with interrupt requests
+ * ks8851_irq_primary - hardirq handler for KSZ8851 interrupts
  * @irq: IRQ number
  * @_ks: cookie
  *
- * This handler is invoked when the IRQ line asserts to find out what happened.
- * As we cannot allow ourselves to sleep in HARDIRQ context, this handler runs
- * in thread context.
- *
- * Read the interrupt status, work out what needs to be done and then clear
- * any of the interrupts that are not needed.
+ * Runs in hardirq context.  Immediately disables the IRQ at the PLIC
+ * (fast MMIO write) and schedules the SPI work.  Returns IRQ_HANDLED
+ * to prevent spurious IRQ detection.
  */
-static irqreturn_t ks8851_irq(int irq, void *_ks)
+static irqreturn_t ks8851_irq_primary(int irq, void *_ks)
 {
 	struct ks8851_net *ks = _ks;
+
+	disable_irq_nosync(irq);
+	schedule_work(&ks->irq_work);
+	return IRQ_HANDLED;
+}
+
+/**
+ * ks8851_irq - process KSZ8851 interrupt events (called from workqueue)
+ */
+static void ks8851_irq(struct ks8851_net *ks)
+{
 	struct sk_buff_head rxq;
-	unsigned handled = 0;
 	unsigned long flags;
 	unsigned int status;
 	struct sk_buff *skb;
+	int link_changed = 0;
+	int link_up = 0;
+
+	__skb_queue_head_init(&rxq);
 
 	ks8851_lock(ks, &flags);
 
+	/* Disable chip IER to de-assert the interrupt line before
+	 * we read ISR — prevents the PLIC from re-latching pending
+	 * during our SPI transactions. */
+	ks8851_wrreg16(ks, KS_IER, 0x0000);
+
 	status = ks8851_rdreg16(ks, KS_ISR);
+	ks8851_wrreg16(ks, KS_ISR, status);
 
 	netif_dbg(ks, intr, ks->netdev,
 		  "%s: status 0x%04x\n", __func__, status);
 
-	if (status & IRQ_LCI)
-		handled |= IRQ_LCI;
+	netif_dbg(ks, intr, ks->netdev, "poll: ISR=0x%04x P1SR=0x%04x\n",
+		  status, ks8851_rdreg16(ks, KS_P1SR));
 
-	if (status & IRQ_LDI) {
+	/* Handle RXPSI (RX Process Stopped) — must be handled regardless
+	 * of rc_ier mask.  Re-enable RX by setting RXCR1 bit 0, matching
+	 * the bare-metal driver's approach. */
+	if (status & IRQ_RXPSI) {
+		u16 rxcr1 = ks8851_rdreg16(ks, KS_RXCR1);
+
+		if (!(rxcr1 & RXCR1_RXE))
+			ks8851_wrreg16(ks, KS_RXCR1, rxcr1 | RXCR1_RXE);
+	}
+
+	if (status & IRQ_LCI) {
 		u16 pmecr = ks8851_rdreg16(ks, KS_PMECR);
 		pmecr &= ~PMECR_WKEVT_MASK;
 		ks8851_wrreg16(ks, KS_PMECR, pmecr | PMECR_WKEVT_LINK);
-
-		handled |= IRQ_LDI;
+		ks8851_rdreg16(ks, KS_P1MBSR); /* dummy read to latch */
+		link_up = !!(ks8851_rdreg16(ks, KS_P1MBSR) & BMSR_LSTATUS);
+		link_changed = 1;
 	}
-
-	if (status & IRQ_RXPSI)
-		handled |= IRQ_RXPSI;
 
 	if (status & IRQ_TXI) {
 		unsigned short tx_space = ks8851_rdreg16(ks, KS_TXMIR);
@@ -360,61 +427,72 @@ static irqreturn_t ks8851_irq(int irq, void *_ks)
 		netif_dbg(ks, intr, ks->netdev,
 			  "%s: txspace %d\n", __func__, tx_space);
 
-		spin_lock(&ks->statelock);
+		spin_lock_bh(&ks->statelock);
 		ks->tx_space = tx_space;
 		if (netif_queue_stopped(ks->netdev))
 			netif_wake_queue(ks->netdev);
-		spin_unlock(&ks->statelock);
-
-		handled |= IRQ_TXI;
+		spin_unlock_bh(&ks->statelock);
 	}
+
+	if (status & IRQ_SPIBEI)
+		netdev_err(ks->netdev, "%s: spi bus error\n", __func__);
 
 	if (status & IRQ_RXI)
-		handled |= IRQ_RXI;
-
-	if (status & IRQ_SPIBEI) {
-		netdev_err(ks->netdev, "%s: spi bus error\n", __func__);
-		handled |= IRQ_SPIBEI;
-	}
-
-	ks8851_wrreg16(ks, KS_ISR, handled);
-
-	if (status & IRQ_RXI) {
-		/* the datasheet says to disable the rx interrupt during
-		 * packet read-out, however we're masking the interrupt
-		 * from the device so do not bother masking just the RX
-		 * from the device. */
-
-		__skb_queue_head_init(&rxq);
 		ks8851_rx_pkts(ks, &rxq);
-	}
-
-	/* if something stopped the rx process, probably due to wanting
-	 * to change the rx settings, then do something about restarting
-	 * it. */
-	if (status & IRQ_RXPSI) {
-		struct ks8851_rxctrl *rxc = &ks->rxctrl;
-
-		/* update the multicast hash table */
-		ks8851_wrreg16(ks, KS_MAHTR0, rxc->mchash[0]);
-		ks8851_wrreg16(ks, KS_MAHTR1, rxc->mchash[1]);
-		ks8851_wrreg16(ks, KS_MAHTR2, rxc->mchash[2]);
-		ks8851_wrreg16(ks, KS_MAHTR3, rxc->mchash[3]);
-
-		ks8851_wrreg16(ks, KS_RXCR2, rxc->rxcr2);
-		ks8851_wrreg16(ks, KS_RXCR1, rxc->rxcr1);
-	}
 
 	ks8851_unlock(ks, &flags);
 
-	if (status & IRQ_LCI)
-		mii_check_link(&ks->mii);
+	if (link_changed) {
+		if (link_up && !netif_carrier_ok(ks->netdev))
+			netif_carrier_on(ks->netdev);
+		else if (!link_up && netif_carrier_ok(ks->netdev))
+			netif_carrier_off(ks->netdev);
+	}
 
-	if (status & IRQ_RXI)
-		while ((skb = __skb_dequeue(&rxq)))
-			netif_rx(skb);
+	while ((skb = __skb_dequeue(&rxq)))
+		netif_rx(skb);
+}
 
-	return IRQ_HANDLED;
+/**
+ * ks8851_irq_work - deferred IRQ processing via workqueue
+ * @work: work structure embedded in ks8851_net
+ *
+ * The hardirq primary handler disables the IRQ at the PLIC level and
+ * schedules this work.  After processing, we re-enable the PLIC IRQ.
+ */
+static void ks8851_irq_work(struct work_struct *work)
+{
+	struct ks8851_net *ks = container_of(work, struct ks8851_net, irq_work);
+	unsigned long flags;
+
+	ks8851_irq(ks);
+
+	/* Re-enable PLIC with source de-asserted (IER still 0). */
+	enable_irq(ks->netdev->irq);
+
+	/* Now re-enable chip IER.  If new events arrived, the source
+	 * asserts and the PLIC fires normally. */
+	ks8851_lock(ks, &flags);
+	ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+	ks8851_unlock(ks, &flags);
+}
+
+/**
+ * ks8851_poll_work - periodic polling of KSZ8851 interrupt status
+ * @work: The work structure
+ *
+ * Fallback for when IRQ request fails.  Periodically calls the IRQ
+ * handler to check for pending events.
+ */
+static void ks8851_poll_work(struct work_struct *work)
+{
+	struct ks8851_net *ks = container_of(work, struct ks8851_net,
+					     poll_work.work);
+
+	ks8851_irq(ks);
+
+	if (netif_running(ks->netdev))
+		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(5));
 }
 
 /**
@@ -440,13 +518,8 @@ static int ks8851_net_open(struct net_device *dev)
 	unsigned long flags;
 	int ret;
 
-	ret = request_threaded_irq(dev->irq, NULL, ks8851_irq,
-				   IRQF_TRIGGER_LOW | IRQF_ONESHOT,
-				   dev->name, ks);
-	if (ret < 0) {
-		netdev_err(dev, "failed to get irq\n");
-		return ret;
-	}
+	INIT_DELAYED_WORK(&ks->poll_work, ks8851_poll_work);
+	INIT_WORK(&ks->irq_work, ks8851_irq_work);
 
 	/* lock the card, even if we may not actually be doing anything
 	 * else at the moment */
@@ -471,39 +544,86 @@ static int ks8851_net_open(struct net_device *dev)
 	/* auto-increment tx data, reset tx pointer */
 	ks8851_wrreg16(ks, KS_TXFDPR, TXFDPR_TXFPAI);
 
-	/* setup receiver control */
+	/* setup receiver control — match bare-metal register values */
 
-	ks8851_wrreg16(ks, KS_RXCR1, (RXCR1_RXPAFMA | /*  from mac filter */
-				      RXCR1_RXFCE | /* enable flow control */
-				      RXCR1_RXBE | /* broadcast enable */
-				      RXCR1_RXUE | /* unicast enable */
-				      RXCR1_RXE)); /* enable rx block */
+	/* reset RX frame data pointer (auto-increment) */
+	ks8851_wrreg16(ks, KS_RXFDPR, RXFDPR_RXFPAI);
 
-	/* transfer entire frames out in one go */
-	ks8851_wrreg16(ks, KS_RXCR2, RXCR2_SRDBL_FRAME);
+	/* 1 frame to trigger IRQ — must be low for polled mode */
+	ks8851_wrreg16(ks, KS_RXFCTR, 1);
 
-	/* set receive counter timeouts */
-	ks8851_wrreg16(ks, KS_RXDTTR, 1000); /* 1ms after first frame to IRQ */
-	ks8851_wrreg16(ks, KS_RXDBCTR, 4096); /* >4Kbytes in buffer to IRQ */
-	ks8851_wrreg16(ks, KS_RXFCTR, 10);  /* 10 frames to IRQ */
+	/* RX config matching bare-metal 0x7CE1: checksum verification,
+	 * MAC filter, flow control, error frames, broadcast, multicast,
+	 * unicast.  Enable RX immediately. */
+	ks8851_wrreg16(ks, KS_RXCR1, (RXCR1_RXUDPFCC | /* UDP checksum */
+				      RXCR1_RXTCPFCC | /* TCP checksum */
+				      RXCR1_RXIPFCC |  /* IP checksum */
+				      RXCR1_RXPAFMA |  /* MAC filter */
+				      RXCR1_RXFCE |    /* flow control */
+				      RXCR1_RXEFE |    /* error frames */
+				      RXCR1_RXBE |     /* broadcast */
+				      RXCR1_RXME |     /* multicast */
+				      RXCR1_RXUE |     /* unicast */
+				      RXCR1_RXE));     /* enable rx */
 
-	ks->rc_rxqcr = (RXQCR_RXFCTE |  /* IRQ on frame count exceeded */
-			RXQCR_RXDBCTE | /* IRQ on byte count exceeded */
-			RXQCR_RXDTTE);  /* IRQ on time exceeded */
+	/* transfer entire frames out in one go + UDP/IP checksum */
+	ks8851_wrreg16(ks, KS_RXCR2, RXCR2_SRDBL_FRAME |
+				      RXCR2_IUFFP | RXCR2_RXIUFCEZ |
+				      RXCR2_UDPLFE);
+
+	/* only frame-count threshold — matches bare-metal */
+	ks->rc_rxqcr = RXQCR_RXFCTE;
 
 	ks8851_wrreg16(ks, KS_RXQCR, ks->rc_rxqcr);
 
-	/* clear then enable interrupts */
-	ks8851_wrreg16(ks, KS_ISR, ks->rc_ier);
-	ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+	/* Restart PHY auto-negotiation — after GRR_GSR reset the PHY
+	 * won't negotiate until explicitly kicked. */
+	ks8851_wrreg16(ks, KS_P1CR,
+		       ks8851_rdreg16(ks, KS_P1CR) | P1CR_RESTARTAN);
+
+	/* clear all pending interrupts */
+	ks8851_wrreg16(ks, KS_ISR, 0xFFFF);
+
+	ks->rc_ier = IRQ_LCI | IRQ_TXI | IRQ_RXI;
 
 	ks->queued_len = 0;
+	ks->tx_space = ks8851_rdreg16(ks, KS_TXMIR);
 	netif_start_queue(ks->netdev);
 
 	netif_dbg(ks, ifup, ks->netdev, "network device up\n");
 
 	ks8851_unlock(ks, &flags);
+
+	/* Use polled mode — the PLIC IRQ wiring to the KSZ8851 INTRN
+	 * pin has not been verified on Sonata.  Poll every 5ms. */
+	ks->use_poll = 1;
+	netdev_info(dev, "using polled mode (5ms interval)\n");
+
+	if (!ks->use_poll) {
+		/* Clear ISR, enable chip IER, then enable PLIC. */
+		ks8851_lock(ks, &flags);
+		ks8851_wrreg16(ks, KS_ISR, 0xFFFF);
+		ks8851_wrreg16(ks, KS_IER, ks->rc_ier);
+		{
+			u16 ier_rb = ks8851_rdreg16(ks, KS_IER);
+			u16 isr_rb = ks8851_rdreg16(ks, KS_ISR);
+			u16 p1mbsr = ks8851_rdreg16(ks, KS_P1MBSR);
+			netdev_info(dev, "open: IER=0x%04x ISR=0x%04x P1MBSR=0x%04x\n",
+				    ier_rb, isr_rb, p1mbsr);
+		}
+		ks8851_unlock(ks, &flags);
+		enable_irq(dev->irq);
+	}
+
+	if (ks->use_poll) {
+		netif_carrier_on(ks->netdev);
+		schedule_delayed_work(&ks->poll_work, msecs_to_jiffies(5));
+	}
+
+	/* Check link status now — if link is already up, no LCI will
+	 * fire, so we must detect it explicitly. */
 	mii_check_link(&ks->mii);
+
 	return 0;
 }
 
@@ -555,7 +675,12 @@ static int ks8851_net_stop(struct net_device *dev)
 		dev_kfree_skb(txb);
 	}
 
-	free_irq(dev->irq, ks);
+	if (ks->use_poll) {
+		cancel_delayed_work_sync(&ks->poll_work);
+	} else {
+		cancel_work_sync(&ks->irq_work);
+		free_irq(dev->irq, ks);
+	}
 
 	return 0;
 }
@@ -597,12 +722,25 @@ static netdev_tx_t ks8851_start_xmit(struct sk_buff *skb,
 static void ks8851_rxctrl_work(struct work_struct *work)
 {
 	struct ks8851_net *ks = container_of(work, struct ks8851_net, rxctrl_work);
+	struct ks8851_rxctrl rxctrl;
 	unsigned long flags;
+
+	spin_lock(&ks->statelock);
+	rxctrl = ks->rxctrl;
+	spin_unlock(&ks->statelock);
 
 	ks8851_lock(ks, &flags);
 
-	/* need to shutdown RXQ before modifying filter parameters */
+	/* disable RX, apply new filter settings, re-enable */
 	ks8851_wrreg16(ks, KS_RXCR1, 0x00);
+
+	ks8851_wrreg16(ks, KS_MAHTR0, rxctrl.mchash[0]);
+	ks8851_wrreg16(ks, KS_MAHTR1, rxctrl.mchash[1]);
+	ks8851_wrreg16(ks, KS_MAHTR2, rxctrl.mchash[2]);
+	ks8851_wrreg16(ks, KS_MAHTR3, rxctrl.mchash[3]);
+
+	ks8851_wrreg16(ks, KS_RXCR2, rxctrl.rxcr2);
+	ks8851_wrreg16(ks, KS_RXCR1, rxctrl.rxcr1);
 
 	ks8851_unlock(ks, &flags);
 }
@@ -642,12 +780,18 @@ static void ks8851_set_rx_mode(struct net_device *dev)
 		rxctrl.rxcr1 = RXCR1_RXPAFMA;
 	}
 
-	rxctrl.rxcr1 |= (RXCR1_RXUE | /* unicast enable */
-			 RXCR1_RXBE | /* broadcast enable */
-			 RXCR1_RXE | /* RX process enable */
-			 RXCR1_RXFCE); /* enable flow control */
+	rxctrl.rxcr1 |= (RXCR1_RXUDPFCC | /* UDP checksum */
+			 RXCR1_RXTCPFCC | /* TCP checksum */
+			 RXCR1_RXIPFCC |  /* IP checksum */
+			 RXCR1_RXFCE |    /* flow control */
+			 RXCR1_RXEFE |    /* error frames */
+			 RXCR1_RXBE |     /* broadcast */
+			 RXCR1_RXUE |     /* unicast */
+			 RXCR1_RXE);      /* enable rx */
 
-	rxctrl.rxcr2 |= RXCR2_SRDBL_FRAME;
+	rxctrl.rxcr2 |= (RXCR2_SRDBL_FRAME |
+			 RXCR2_IUFFP | RXCR2_RXIUFCEZ |
+			 RXCR2_UDPLFE);
 
 	/* schedule work to do the actual set of the data if needed */
 

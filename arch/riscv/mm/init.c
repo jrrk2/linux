@@ -1098,8 +1098,14 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	 * physical addresses (if the start of dram is different from the
 	 * kernel physical address start).
 	 */
+	/*
+	 * For RV32 XIP, shift the linear mapping so it starts at
+	 * virt_addr + XIP_OFFSET instead of PAGE_OFFSET, avoiding overlap
+	 * with the XIP code region mapped from flash.
+	 */
 	kernel_map.va_pa_offset = IS_ENABLED(CONFIG_64BIT) ?
-				0UL : PAGE_OFFSET - kernel_map.phys_addr;
+				0UL : PAGE_OFFSET - kernel_map.phys_addr +
+				(IS_ENABLED(CONFIG_XIP_KERNEL) ? XIP_OFFSET : 0);
 	kernel_map.va_kernel_pa_offset = kernel_map.virt_addr - kernel_map.phys_addr;
 
 	/*
@@ -1170,7 +1176,12 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 #else
 	/* Setup trampoline PGD */
 	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
-			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#ifdef CONFIG_XIP_KERNEL
+			   kernel_map.xiprom,
+#else
+			   kernel_map.phys_addr,
+#endif
+			   PGDIR_SIZE, PAGE_KERNEL_EXEC);
 #endif
 
 	/*
@@ -1315,7 +1326,7 @@ static void __init setup_vm_final(void)
 	create_linear_mapping_page_table();
 
 	/* Map the kernel */
-	if (IS_ENABLED(CONFIG_64BIT))
+	if (IS_ENABLED(CONFIG_64BIT) || IS_ENABLED(CONFIG_XIP_KERNEL))
 		create_kernel_page_table(swapper_pg_dir, false);
 
 #ifdef CONFIG_KASAN

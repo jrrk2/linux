@@ -514,6 +514,13 @@ config SPI_JCORE
 	  This enables support for the SPI master controller in the J-Core
 	  synthesizable, open source SoC.
 
+config SPI_LITESPI
+	tristate "LiteSPI SPI master driver"
+	depends on OF && LITEX
+	help
+	  This enables support for LiteSPI, the SPI master controller of
+	  the LiteX FPGA SoC builder.
+
 config SPI_LM70_LLP
 	tristate "Parallel port adapter for LM70 eval board (DEVELOPMENT)"
 	depends on PARPORT
@@ -951,6 +958,13 @@ config SPI_SIFIVE
 	depends on HAS_IOMEM
 	help
 	  This exposes the SPI controller IP from SiFive.
+
+config SPI_OPENTITAN
+	tristate "OpenTitan SPI controller"
+	depends on SPI_MASTER
+	help
+	  SPI controller driver for OpenTitan-compatible SPI peripherals,
+	  as used on the Sonata FPGA board.
 
 config SPI_SLAVE_MT27XX
 	tristate "MediaTek SPI slave device"

@@ -19,6 +19,7 @@
 #include <linux/mii.h>
 #include <linux/regulator/consumer.h>
 
+#include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/gpio.h>
 #include <linux/of_gpio.h>
@@ -209,33 +210,43 @@ static unsigned int ks8851_rdreg16_spi(struct ks8851_net *ks, unsigned int reg)
  *
  * Issue an RXQ FIFO read command and read the @len amount of data from
  * the FIFO into the buffer specified by @buff.
+ *
+ * Uses a single SPI transfer: [0x80 cmd byte] [len data bytes] so that
+ * the entire FIFO read happens in one CS assertion, matching the
+ * bare-metal driver approach.
  */
 static void ks8851_rdfifo_spi(struct ks8851_net *ks, u8 *buff, unsigned int len)
 {
 	struct ks8851_net_spi *kss = to_ks8851_spi(ks);
-	struct spi_transfer *xfer = kss->spi_xfer2;
-	struct spi_message *msg = &kss->spi_msg2;
-	u8 txb[1];
+	struct spi_transfer *xfer = &kss->spi_xfer1;
+	struct spi_message *msg = &kss->spi_msg1;
+	unsigned int total = 1 + len;
+	u8 *txb;
 	int ret;
 
 	netif_dbg(ks, rx_status, ks->netdev,
 		  "%s: %d@%p\n", __func__, len, buff);
 
-	/* set the operation we're issuing */
+	txb = kzalloc(total, GFP_KERNEL);
+	if (!txb) {
+		netdev_err(ks->netdev, "%s: alloc failed\n", __func__);
+		return;
+	}
+
 	txb[0] = KS_SPIOP_RXFIFO;
+	/* rest is zeros — just need clock cycles for the chip to shift out */
 
 	xfer->tx_buf = txb;
-	xfer->rx_buf = NULL;
-	xfer->len = 1;
-
-	xfer++;
-	xfer->rx_buf = buff;
-	xfer->tx_buf = NULL;
-	xfer->len = len;
+	xfer->rx_buf = txb;  /* reuse buffer for RX */
+	xfer->len = total;
 
 	ret = spi_sync(kss->spidev, msg);
 	if (ret < 0)
 		netdev_err(ks->netdev, "%s: spi_sync() failed\n", __func__);
+	else
+		memcpy(buff, txb + 1, len); /* skip the command byte */
+
+	kfree(txb);
 }
 
 /**
