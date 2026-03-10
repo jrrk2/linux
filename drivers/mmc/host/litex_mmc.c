@@ -11,11 +11,12 @@
  * Register map and init sequence proven by sdtest userspace tool.
  *
  * Requires FPGA built with --with-coherent-dma so the SD card DMA
- * engine routes through the CPU cache. Uses dma_alloc_coherent for
- * the bounce buffer.
+ * engine routes through the CPU cache. Supports direct scatter-gather
+ * DMA (zero-copy) when buffers are physically contiguous, falling back
+ * to a coherent bounce buffer otherwise.
  */
 
-#define LITEX_SD_VERSION "1.0"
+#define LITEX_SD_VERSION "1.2"
 
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -25,6 +26,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/scatterlist.h>
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
@@ -80,13 +82,13 @@
 #define SD_CMD_TIMEOUT_US  100000   /* 100ms */
 #define SD_DATA_TIMEOUT_US 2000000  /* 2s */
 
-#define DMA_BUF_SIZE       4096
+#define DMA_BUF_SIZE       PAGE_SIZE
 
 struct litex_sd_host {
 	struct mmc_host *mmc;
 	void __iomem *regs;
-	void *dma_buf;
-	dma_addr_t dma_phys;
+	void *dma_buf;         /* Coherent bounce buffer */
+	dma_addr_t dma_phys;   /* Physical address of bounce buffer */
 	unsigned int ref_clk;
 };
 
@@ -131,12 +133,16 @@ static void litex_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
 {
 	struct litex_sd_host *host = mmc_priv(mmc);
 	struct device *dev = mmc_dev(mmc);
+	struct mmc_command *sbc = mrq->sbc;
 	struct mmc_command *cmd = mrq->cmd;
 	struct mmc_data *data = mrq->data;
 	struct mmc_command *stop = mrq->stop;
 	u32 rsp = sd_rsp_type(cmd);
 	u32 xfer = SD_XFER_NONE;
 	unsigned int len = 0;
+	unsigned int retries = cmd->retries;
+	dma_addr_t dma_addr = host->dma_phys;
+	bool direct = false;
 	int ret;
 
 	/* Check card presence */
@@ -146,45 +152,77 @@ static void litex_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
 		return;
 	}
 
+	/* Send set-block-count (CMD23) if provided */
+	if (sbc) {
+		sd_write(host, SD_CMD_ARG, sbc->arg);
+		sd_write(host, SD_CMD_CMD,
+			 (sbc->opcode << 8) | sd_rsp_type(sbc));
+		sd_write(host, SD_CMD_SEND, 1);
+		sbc->error = sd_wait_evt(host, SD_CMD_EVENT,
+					 SD_CMD_TIMEOUT_US);
+		if (sbc->error) {
+			mmc_request_done(mmc, mrq);
+			return;
+		}
+		sbc->resp[0] = sd_read(host, SD_CMD_RSP3);
+	}
+
 	/* Set up DMA for data transfers */
 	if (data) {
+		int sg_count;
+
 		len = data->blksz * data->blocks;
-		if (len > DMA_BUF_SIZE) {
-			dev_err(dev, "xfer too large: %u\n", len);
+		sd_write(host, SD_BLK_LENGTH, data->blksz);
+		sd_write(host, SD_BLK_COUNT, data->blocks);
+
+		/* Try direct DMA to/from sg buffer (zero-copy).
+		 * With max_segs=1, MMC core always gives a single segment,
+		 * so this path should always succeed.
+		 */
+		sg_count = dma_map_sg(dev, data->sg, data->sg_len,
+				      mmc_get_dma_dir(data));
+		if (sg_count == 1 && sg_dma_len(data->sg) >= len) {
+			dma_addr = sg_dma_address(data->sg);
+			direct = true;
+		} else if (len > DMA_BUF_SIZE) {
+			dev_err(dev, "no direct DMA and xfer too large: %u\n",
+				len);
+			dma_unmap_sg(dev, data->sg, data->sg_len,
+				     mmc_get_dma_dir(data));
 			cmd->error = -EINVAL;
 			mmc_request_done(mmc, mrq);
 			return;
 		}
 
-		sd_write(host, SD_BLK_LENGTH, data->blksz);
-		sd_write(host, SD_BLK_COUNT, data->blocks);
-
 		if (data->flags & MMC_DATA_READ) {
 			xfer = SD_XFER_READ;
 			sd_write(host, SD_RD_ENABLE, 0);
 			sd_write(host, SD_RD_BASE_HI, 0);
-			sd_write(host, SD_RD_BASE_LO, host->dma_phys);
+			sd_write(host, SD_RD_BASE_LO, dma_addr);
 			sd_write(host, SD_RD_LENGTH, len);
 			sd_write(host, SD_RD_ENABLE, 1);
 		} else {
 			xfer = SD_XFER_WRITE;
-			sg_copy_to_buffer(data->sg, data->sg_len,
-					  host->dma_buf, len);
+			if (!direct)
+				sg_copy_to_buffer(data->sg, data->sg_len,
+						  host->dma_buf, len);
 			sd_write(host, SD_WR_ENABLE, 0);
 			sd_write(host, SD_WR_BASE_HI, 0);
-			sd_write(host, SD_WR_BASE_LO, host->dma_phys);
+			sd_write(host, SD_WR_BASE_LO, dma_addr);
 			sd_write(host, SD_WR_LENGTH, len);
 			sd_write(host, SD_WR_ENABLE, 1);
 		}
 	}
 
-	/* Send command: opcode<<8 | xfer_type<<5 | rsp_type */
-	sd_write(host, SD_CMD_ARG, cmd->arg);
-	sd_write(host, SD_CMD_CMD, (cmd->opcode << 8) | (xfer << 5) | rsp);
-	sd_write(host, SD_CMD_SEND, 1);
+	/* Send command with retries */
+	do {
+		sd_write(host, SD_CMD_ARG, cmd->arg);
+		sd_write(host, SD_CMD_CMD,
+			 (cmd->opcode << 8) | (xfer << 5) | rsp);
+		sd_write(host, SD_CMD_SEND, 1);
+		ret = sd_wait_evt(host, SD_CMD_EVENT, SD_CMD_TIMEOUT_US);
+	} while (ret && retries-- > 0);
 
-	/* Wait for command completion */
-	ret = sd_wait_evt(host, SD_CMD_EVENT, SD_CMD_TIMEOUT_US);
 	if (ret) {
 		dev_dbg(dev, "CMD%d error: %d\n", cmd->opcode, ret);
 		cmd->error = ret;
@@ -228,14 +266,18 @@ static void litex_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
 			goto out;
 		}
 
-		if (xfer == SD_XFER_READ)
+		if (xfer == SD_XFER_READ && !direct)
 			sg_copy_from_buffer(data->sg, data->sg_len,
 					    host->dma_buf, len);
 		data->bytes_xfered = len;
 	}
 
 out:
-	if (stop) {
+	if (data)
+		dma_unmap_sg(dev, data->sg, data->sg_len,
+			     mmc_get_dma_dir(data));
+
+	if (stop && (cmd->error || !sbc)) {
 		sd_write(host, SD_CMD_ARG, stop->arg);
 		sd_write(host, SD_CMD_CMD,
 			 (stop->opcode << 8) | SD_RSP_SHORT_BUSY);
@@ -256,6 +298,7 @@ static void litex_sd_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	if (ios->clock) {
 		u32 div = DIV_ROUND_UP(host->ref_clk, ios->clock);
 
+		div = roundup_pow_of_two(div);
 		div = clamp(div, 2U, 256U);
 		sd_write(host, SD_PHY_CLK_DIV, div);
 	}
@@ -322,16 +365,17 @@ static int litex_sd_probe(struct platform_device *pdev)
 
 	mmc->ops        = &litex_sd_ops;
 	mmc->f_min      = 400000;
-	mmc->f_max      = 25000000;
+	mmc->f_max      = 50000000;
 	mmc->ocr_avail  = MMC_VDD_32_33 | MMC_VDD_33_34;
-	mmc->caps       = MMC_CAP_4_BIT_DATA | MMC_CAP_NEEDS_POLL;
+	mmc->caps       = MMC_CAP_4_BIT_DATA | MMC_CAP_NEEDS_POLL |
+			  MMC_CAP_CMD23 | MMC_CAP_WAIT_WHILE_BUSY;
 	mmc->caps2      = MMC_CAP2_NO_SDIO | MMC_CAP2_NO_WRITE_PROTECT |
 			  MMC_CAP2_NO_MMC;
-	mmc->max_blk_count = 8;
 	mmc->max_blk_size  = 512;
-	mmc->max_req_size  = DMA_BUF_SIZE;
-	mmc->max_seg_size  = DMA_BUF_SIZE;
-	mmc->max_segs      = 1;
+	mmc->max_blk_count = 128;              /* 64KB per request */
+	mmc->max_req_size  = 128 * 512;
+	mmc->max_seg_size  = 128 * 512;
+	mmc->max_segs      = 1;               /* Single sg = always direct DMA */
 
 	/* Initialize hardware: 1-bit, slow clock, DMA off */
 	sd_write(host, SD_PHY_SETTINGS, 0);
@@ -382,6 +426,7 @@ static struct platform_driver litex_sd_driver = {
 	.driver = {
 		.name           = "litex-mmc",
 		.of_match_table = litex_sd_match,
+		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
 	},
 };
 module_platform_driver(litex_sd_driver);
