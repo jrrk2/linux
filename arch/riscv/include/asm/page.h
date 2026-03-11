@@ -156,8 +156,7 @@ phys_addr_t linear_mapping_va_to_pa(unsigned long x);
 
 #define __va_to_pa_nodebug(x)	({						\
 	unsigned long _x = x;							\
-	(IS_ENABLED(CONFIG_XIP_KERNEL) &&					\
-	 _x >= kernel_map.virt_addr + XIP_OFFSET) ?				\
+	is_kernel_mapping(_x) ?							\
 		kernel_mapping_va_to_pa(_x) :					\
 	is_linear_mapping(_x) ?							\
 		linear_mapping_va_to_pa(_x) : kernel_mapping_va_to_pa(_x);	\
