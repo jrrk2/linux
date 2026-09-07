@@ -145,8 +145,13 @@ static void litex_sd_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	bool direct = false;
 	int ret;
 
-	/* Check card presence */
-	if (sd_read(host, SD_PHY_CARD_DET)) {
+	/* Check card presence.  A host declared non-removable in the device
+	 * tree has no meaningful detect line -- the card is soldered down, or
+	 * the CD pin is not wired -- and the MMC core will not consult get_cd
+	 * either.  Refusing every request here would make that declaration
+	 * useless, so honour it. */
+	if (!(mmc->caps & MMC_CAP_NONREMOVABLE) &&
+	    sd_read(host, SD_PHY_CARD_DET)) {
 		cmd->error = -ENOMEDIUM;
 		mmc_request_done(mmc, mrq);
 		return;
