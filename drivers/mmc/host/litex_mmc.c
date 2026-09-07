@@ -377,6 +377,16 @@ static int litex_sd_probe(struct platform_device *pdev)
 	mmc->max_seg_size  = 128 * 512;
 	mmc->max_segs      = 1;               /* Single sg = always direct DMA */
 
+	/* Let the device tree lower these.  Reads are reliable at 1 MHz on the
+	 * VC707 and corrupt at the hardcoded 50 MHz -- CMD17 returns CRC errors
+	 * while the BIOS, which honours its own divider, reads block 0 back
+	 * correctly.  Without this call max-frequency and bus-width in the DT
+	 * are silently discarded.
+	 */
+	ret = mmc_of_parse(mmc);
+	if (ret)
+		goto err_free;
+
 	/* Initialize hardware: 1-bit, slow clock, DMA off */
 	sd_write(host, SD_PHY_SETTINGS, 0);
 	sd_write(host, SD_RD_ENABLE, 0);
